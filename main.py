@@ -48,7 +48,19 @@ def save_camera_store(data):
 def load_cameras():
     global cameras
     cameras = load_camera_store()
-    print(f"[INFO] Loaded {len(cameras)} cameras")
+
+    # 🔥 Ensure all cameras have metadata
+    for cam in cameras:
+        if "position" not in cam:
+            cam["position"] = {"x": 0, "y": 0, "z": 0}
+
+        if "orientation" not in cam:
+            cam["orientation"] = {"pan": 0, "tilt": 0, "zoom": 1}
+
+        if "fov" not in cam:
+            cam["fov"] = 90
+
+    print(f"[INFO] Loaded {len(cameras)} cameras with metadata")
 
 
 # ---------------- RTSP ----------------
@@ -262,6 +274,19 @@ async def add_camera(req: Request):
         "ip": data["ip"],
         "username": data.get("username", ""),
         "password": data.get("password", ""),
+
+        # 🔥 NEW METADATA
+        "position": {
+            "x": float(data.get("position", {}).get("x", 0)),
+            "y": float(data.get("position", {}).get("y", 0)),
+            "z": float(data.get("position", {}).get("z", 0)),
+        },
+        "orientation": {
+            "pan": float(data.get("orientation", {}).get("pan", 0)),
+            "tilt": float(data.get("orientation", {}).get("tilt", 0)),
+            "zoom": float(data.get("orientation", {}).get("zoom", 1)),
+        },
+        "fov": float(data.get("fov", 90))
     }
 
     cams.append(cam)
@@ -270,7 +295,7 @@ async def add_camera(req: Request):
     cameras.append(cam)
     init_streams()
 
-    return {"status": "added"}
+    return {"status": "added", "camera": cam}
 
 
 @app.post("/delete_camera")

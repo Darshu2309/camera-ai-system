@@ -17,7 +17,6 @@
 
         .camera { border:2px solid green; }
 
-        /* 🔥 UPDATED: canvas instead of img */
         .camera canvas {
             width:100%;
             height:150px;
@@ -31,6 +30,18 @@
 
         table { width:100%; border-collapse:collapse; }
         td,th { border:1px solid #ccc; padding:5px; }
+
+        /* 🔥 NEW: section styling */
+        .section {
+            margin-top:10px;
+            padding:10px;
+            border:1px solid #ccc;
+            border-radius:5px;
+        }
+
+        .section h4 {
+            margin:5px 0;
+        }
     </style>
 </head>
 
@@ -88,18 +99,43 @@
     <div id="addForm" style="display:none;">
         <h3>Add Camera</h3>
 
-        <input id="ip" placeholder="IP">
-        <input id="user" placeholder="Username">
-        <input id="pass" placeholder="Password">
-        <input id="name" placeholder="Camera Name">
-        <input id="rtsp" placeholder="RTSP URL">
+        <!-- BASIC INFO -->
+        <div class="section">
+            <h4>Basic Info</h4>
+            <input id="ip" placeholder="IP">
+            <input id="user" placeholder="Username">
+            <input id="pass" placeholder="Password">
+            <input id="name" placeholder="Camera Name">
+            <input id="rtsp" placeholder="RTSP URL (optional)">
+        </div>
+
+        <!-- 🔥 POSITION -->
+        <div class="section">
+            <h4>Position (3D Coordinates)</h4>
+            <input id="posX" placeholder="X (e.g. 10)">
+            <input id="posY" placeholder="Y (e.g. 5)">
+            <input id="posZ" placeholder="Z (height)">
+        </div>
+
+        <!-- 🔥 ORIENTATION -->
+        <div class="section">
+            <h4>Orientation</h4>
+            <input id="pan" placeholder="Pan (0–360)">
+            <input id="tilt" placeholder="Tilt (-90 to 90)">
+            <input id="zoom" placeholder="Zoom (default 1)">
+        </div>
+
+        <!-- 🔥 FOV -->
+        <div class="section">
+            <h4>Field of View</h4>
+            <input id="fov" placeholder="FOV (e.g. 90)">
+        </div>
 
         <button onclick="addCamera()">Submit</button>
     </div>
 
 </div>
 
-<!-- ✅ APP SCRIPT -->
 <script src="/static/app.js"></script>
 
 </body>

@@ -118,17 +118,35 @@ async function addCamera() {
         username: document.getElementById("user").value,
         password: document.getElementById("pass").value,
         name: document.getElementById("name").value,
-        rtsp_url: document.getElementById("rtsp").value
+
+        // 🔥 NEW METADATA
+        position: {
+            x: parseFloat(document.getElementById("posX").value) || 0,
+            y: parseFloat(document.getElementById("posY").value) || 0,
+            z: parseFloat(document.getElementById("posZ").value) || 0
+        },
+        orientation: {
+            pan: parseFloat(document.getElementById("pan").value) || 0,
+            tilt: parseFloat(document.getElementById("tilt").value) || 0,
+            zoom: parseFloat(document.getElementById("zoom").value) || 1
+        },
+        fov: parseFloat(document.getElementById("fov").value) || 90
     };
 
-    await fetch("/add_camera", {
+    const res = await fetch("/add_camera", {
         method: "POST",
         headers: {"Content-Type":"application/json"},
         body: JSON.stringify(payload)
     });
 
-    alert("Added");
-    showCameras();
+    const data = await res.json();
+
+    if (data.error) {
+        alert("Error: " + data.error);
+    } else {
+        alert("Camera Added with Metadata");
+        showCameras();
+    }
 }
 
 async function deleteCamera(id) {
