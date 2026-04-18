@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Surveillance</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <style>
+        body { display:flex; margin:0; font-family:Arial; overflow:hidden; }
+        .sidebar { width:220px; background:#111; color:white; padding:15px; height:100vh; }
+        .main { flex:1; padding:10px; height:100vh; overflow:auto; }
+
+        .grid {
+            display:grid;
+            grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+            gap:8px;
+        }
+
+        .camera { border:2px solid green; }
+
+        /* 🔥 UPDATED: canvas instead of img */
+        .camera canvas {
+            width:100%;
+            height:150px;
+            object-fit:cover;
+            background:black;
+        }
+
+        button { width:100%; margin-bottom:5px; padding:6px; cursor:pointer; }
+
+        input { width:100%; margin-bottom:6px; padding:6px; }
+
+        table { width:100%; border-collapse:collapse; }
+        td,th { border:1px solid #ccc; padding:5px; }
+    </style>
+</head>
+
+<body>
+
+<div class="sidebar">
+    <h3>Menu</h3>
+    <button onclick="showLive()">Live View</button>
+    <button onclick="showAnalytics()">Analytics</button>
+    <button onclick="showCameras()">Camera Management</button>
+</div>
+
+<div class="main">
+
+    <!-- ================= LIVE VIEW ================= -->
+    <div id="live">
+        <h3>Live Surveillance</h3>
+        <div class="grid" id="grid"></div>
+    </div>
+
+    <!-- ================= ANALYTICS ================= -->
+    <div id="analytics" style="display:none;">
+        <h3>Analytics</h3>
+        <canvas id="chart"></canvas>
+    </div>
+
+    <!-- ================= CAMERA MANAGEMENT ================= -->
+    <div id="cams" style="display:none;">
+        <h3>Camera Management</h3>
+
+        <button onclick="discoverCameras()">Discover Local Cameras</button>
+        <button onclick="showAdd()">Add Camera</button>
+
+        <div id="discoverBox" style="margin:12px 0;"></div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Name</th>
+                    <th>IP</th>
+                    <th>User</th>
+                    <th>Password</th>
+                    <th>RTSP URL</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="camTable">
+                <tr><td colspan="7">Loading cameras...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- ================= ADD CAMERA ================= -->
+    <div id="addForm" style="display:none;">
+        <h3>Add Camera</h3>
+
+        <input id="ip" placeholder="IP">
+        <input id="user" placeholder="Username">
+        <input id="pass" placeholder="Password">
+        <input id="name" placeholder="Camera Name">
+        <input id="rtsp" placeholder="RTSP URL">
+
+        <button onclick="addCamera()">Submit</button>
+    </div>
+
+</div>
+
+<!-- ✅ APP SCRIPT -->
+<script src="/static/app.js"></script>
+
+</body>
+</html>

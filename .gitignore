@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# AI Models (VERY IMPORTANT)
+*.pt
+
+# Environment
+.env
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Optional (for security)
+cameras.json
