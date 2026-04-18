@@ -2,8 +2,10 @@
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi import WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 import asyncio
 import base64
+import math
 
 MAX_CAMERAS = 12
 
@@ -217,6 +219,50 @@ def render_frame(cam_id):
 
     return buffer.tobytes()
 
+def calculate_ptz(camera, target):
+    cam_pos = camera["position"]
+
+    dx = target["x"] - cam_pos["x"]
+    dy = target["y"] - cam_pos["y"]
+    dz = target["z"] - cam_pos["z"]
+
+    distance_xy = math.sqrt(dx**2 + dy**2)
+
+    pan = math.degrees(math.atan2(dy, dx))
+    tilt = math.degrees(math.atan2(dz, distance_xy))
+
+    return {
+        "pan": round(pan, 2),
+        "tilt": round(tilt, 2),
+        "distance": round(distance_xy, 2)
+    }
+
+class Position(BaseModel):
+    x: float
+    y: float
+    z: float
+
+class Orientation(BaseModel):
+    pan: float
+    tilt: float
+    zoom: float
+
+class CameraCreate(BaseModel):
+    ip: str
+    username: str
+    password: str
+    name: str
+    position: Position
+    orientation: Orientation
+    fov: float
+
+class MoveRequest(BaseModel):
+    camera_id: int
+    target: Position
+
+class DeleteRequest(BaseModel):
+    id: int
+
 # 🔥 SINGLE FRAME
 @app.get("/frame/{cam_id}")
 def frame(cam_id: int):
@@ -258,35 +304,34 @@ def status():
 
 
 @app.post("/add_camera")
-async def add_camera(req: Request):
-    data = await req.json()
+async def add_camera(req: CameraCreate):
     cams = load_camera_store()
 
     for cam in cams:
-        if cam["ip"] == data["ip"]:
+        if cam["ip"] == req.ip:
             raise HTTPException(400, "Camera already exists")
 
     new_id = max([c["id"] for c in cams], default=0) + 1
 
     cam = {
         "id": new_id,
-        "name": data.get("name", f"Camera {new_id}"),
-        "ip": data["ip"],
-        "username": data.get("username", ""),
-        "password": data.get("password", ""),
+        "name": req.name,
+        "ip": req.ip,
+        "username": req.username,
+        "password": req.password,
 
         # 🔥 NEW METADATA
         "position": {
-            "x": float(data.get("position", {}).get("x", 0)),
-            "y": float(data.get("position", {}).get("y", 0)),
-            "z": float(data.get("position", {}).get("z", 0)),
+            "x": req.position.x,
+            "y": req.position.y,
+            "z": req.position.z,
         },
         "orientation": {
-            "pan": float(data.get("orientation", {}).get("pan", 0)),
-            "tilt": float(data.get("orientation", {}).get("tilt", 0)),
-            "zoom": float(data.get("orientation", {}).get("zoom", 1)),
+            "pan": req.orientation.pan,
+            "tilt": req.orientation.tilt,
+            "zoom": req.orientation.zoom
         },
-        "fov": float(data.get("fov", 90))
+        "fov": req.fov
     }
 
     cams.append(cam)
@@ -299,9 +344,8 @@ async def add_camera(req: Request):
 
 
 @app.post("/delete_camera")
-async def delete_camera(req: Request):
-    data = await req.json()
-    cam_id = int(data["id"])
+async def delete_camera(req: DeleteRequest):
+    cam_id = req.id
 
     cams = [c for c in load_camera_store() if c["id"] != cam_id]
     save_camera_store(cams)
@@ -312,6 +356,32 @@ async def delete_camera(req: Request):
 
     return {"status": "deleted"}
 
+@app.post("/move_to")
+async def move_to(data: MoveRequest):
+    try:
+        cam_id = data.camera_id
+        target = data.target.dict()
+
+        cam = next((c for c in cameras if c["id"] == cam_id), None)
+
+        if not cam:
+            raise HTTPException(404, f"Camera {cam_id} not found")
+
+        # 🔥 Ensure metadata exists
+        if "position" not in cam:
+            raise HTTPException(400, "Camera missing position metadata")
+
+        ptz = calculate_ptz(cam, target)
+
+        return {
+            "camera_id": cam_id,
+            "target": target,
+            "calculated_ptz": ptz
+        }
+
+    except Exception as e:
+        print("ERROR in /move_to:", e)
+        raise HTTPException(500, str(e))
 
 # 🔥 FIXED HOME
 @app.get("/", response_class=HTMLResponse)

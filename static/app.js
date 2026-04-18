@@ -161,3 +161,17 @@ async function deleteCamera(id) {
 
 // ---------------- START ----------------
 showLive();
+
+async function testMove() {
+    const res = await fetch("/move_to", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+            camera_id: 1,
+            target: {x: 10, y: 5, z: 0}
+        })
+    });
+
+    const data = await res.json();
+    console.log("PTZ:", data);
+}
