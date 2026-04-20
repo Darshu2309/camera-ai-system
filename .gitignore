@@ -17,3 +17,9 @@ Thumbs.db
 
 # Optional (for security)
 cameras.json
+
+credentials.json
+client_secrets.json
+settings.yaml
+*.jpg
+*.png
