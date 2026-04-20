@@ -3,11 +3,14 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
+from ptz_controller import PTZController
+import asyncio
 import asyncio
 import base64
 import math
 
 MAX_CAMERAS = 12
+PTZ_MODE = "simulation"   # change to "real" later
 
 import cv2
 import json
@@ -41,7 +44,8 @@ def load_camera_store():
         CAMERAS_FILE.write_text("[]")
         return []
     return json.loads(CAMERAS_FILE.read_text())
-
+    def init_camera_defaults():
+        """Initialize default camera if store is empty"""
 
 def save_camera_store(data):
     CAMERAS_FILE.write_text(json.dumps(data, indent=4))
@@ -112,7 +116,7 @@ class CameraStream:
             ret, frame = self.cap.read()
 
             if ret:
-                frame = cv2.resize(frame, (640, 360))
+                frame = cv2.resize(frame, (960, 540))
                 self.raw_frame = frame
             else:
                 self.connect()
@@ -150,43 +154,27 @@ def init_streams():
 
 
 # ---------------- AI ----------------
+# ---------------- AI ----------------
 def ai_worker():
     while True:
         for cam_id, stream in list(streams.items()):
-            frame = stream.raw_frame   # 🔥 DIRECT ACCESS (NO DELAY)
+            frame = stream.raw_frame
 
             if frame is None:
                 continue
 
-            # 🔥 small frame for faster AI
-            small = cv2.resize(frame, (416, 240))
-
-            detections = detect_objects(small)
-
-            # scale back
-            scaled = []
-            for obj in detections:
-                x1, y1, x2, y2 = obj["bbox"]
-
-                x_scale = 640 / 416
-                y_scale = 360 / 240
-
-                scaled.append({
-                    "label": obj["label"],
-                    "bbox": [
-                        int(x1 * x_scale),
-                        int(y1 * y_scale),
-                        int(x2 * x_scale),
-                        int(y2 * y_scale),
-                    ]
-                })
+            # 🔥 UPDATED (added alert)
+            processed_frame, detections, alert = detect_objects(frame, cam_id)
 
             with state_lock:
-                results[cam_id] = scaled
+                results[cam_id] = {
+                    "objects": detections,
+                    "alert": alert
+                }
 
         time.sleep(0.03)
 
-
+# ---------------- FRAME ----------------
 # ---------------- FRAME ----------------
 def render_frame(cam_id):
     stream = streams.get(cam_id)
@@ -198,18 +186,35 @@ def render_frame(cam_id):
         _, buffer = cv2.imencode(".jpg", blank)
         return buffer.tobytes()
 
-    frame = stream.raw_frame.copy()   # 🔥 ALWAYS LATEST FRAME
+    frame = stream.raw_frame.copy()
 
     with state_lock:
-        objs = results.get(cam_id, [])
+        data = results.get(cam_id, {"objects": [], "alert": False})
+        objs = data["objects"]
+        alert = data["alert"]
 
+    # ✅ DRAW OBJECTS (FIXED — ADD BOX)
     for obj in objs:
         x1, y1, x2, y2 = obj["bbox"]
         label = obj["label"]
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
         cv2.putText(frame, label, (x1, y1 - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # 🚨 ALERT DISPLAY
+    if alert:
+        cv2.putText(frame, "🚨 PERSON MOVING",
+                    (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 0, 255),
+                    3)
+
+        cv2.rectangle(frame, (0, 0),
+                      (frame.shape[1], frame.shape[0]),
+                      (0, 0, 255), 4)
 
     _, buffer = cv2.imencode(
         ".jpg",
@@ -365,22 +370,59 @@ async def move_to(data: MoveRequest):
         cam = next((c for c in cameras if c["id"] == cam_id), None)
 
         if not cam:
-            raise HTTPException(404, f"Camera {cam_id} not found")
-
-        # 🔥 Ensure metadata exists
-        if "position" not in cam:
-            raise HTTPException(400, "Camera missing position metadata")
+            raise HTTPException(404, "Camera not found")
 
         ptz = calculate_ptz(cam, target)
 
-        return {
-            "camera_id": cam_id,
-            "target": target,
-            "calculated_ptz": ptz
-        }
+        pan = max(min(ptz["pan"] / 180, 1), -1)
+        tilt = max(min(ptz["tilt"] / 90, 1), -1)
+
+        # =============================
+        # 🔵 SIMULATION MODE
+        # =============================
+        if PTZ_MODE == "simulation":
+            print(f"""
+===== PTZ SIMULATION =====
+Camera: {cam_id}
+Target: {target}
+
+Pan: {ptz['pan']}°
+Tilt: {ptz['tilt']}°
+
+Normalized:
+Pan: {pan}
+Tilt: {tilt}
+=========================
+""")
+
+            return {
+                "status": "simulated",
+                "ptz": ptz
+            }
+
+        # =============================
+        # 🔴 REAL PTZ MODE
+        # =============================
+        elif PTZ_MODE == "real":
+            controller = PTZController(
+                cam["ip"],
+                cam["username"],
+                cam["password"]
+            )
+
+            controller.move(pan, tilt, 0)
+            await asyncio.sleep(0.7)
+            controller.stop()
+
+            print("✅ REAL CAMERA MOVED")
+
+            return {
+                "status": "moved",
+                "ptz": ptz
+            }
 
     except Exception as e:
-        print("ERROR in /move_to:", e)
+        print("PTZ ERROR:", e)
         raise HTTPException(500, str(e))
 
 # 🔥 FIXED HOME
@@ -419,26 +461,51 @@ async def websocket_stream(websocket: WebSocket, cam_id: int):
 
             frame = stream.raw_frame.copy()
 
-            # draw detections
-            with state_lock:
-                objs = results.get(cam_id, [])
+            h, w = frame.shape[:2]
+            cam_center = (w // 2, h // 2)
 
+            cv2.circle(frame, cam_center, 5, (0, 255, 0), -1)
+
+            with state_lock:
+                data = results.get(cam_id, {"objects": [], "alert": False})
+                objs = data["objects"]
+                alert = data["alert"]
+
+            # ✅ DRAW OBJECTS (CLEAN)
             for obj in objs:
                 x1, y1, x2, y2 = obj["bbox"]
                 label = obj["label"]
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
-                cv2.putText(frame, label, (x1, y1-5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                cv2.putText(frame, label,
+                            (x1, y1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 255, 0),
+                            2)
 
-            # 🔥 SEND BASE64 FRAME
+            # 🚨 ALERT
+            if alert:
+                cv2.putText(frame, "PERSON MOVEMENT DETECTED",
+                            (50, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1,
+                            (0, 0, 255),
+                            3)
+
+                cv2.rectangle(frame, (0, 0),
+                              (frame.shape[1], frame.shape[0]),
+                              (0, 0, 255), 4)
+
+            _, buffer = cv2.imencode(".jpg", frame,
+                                    [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+
             jpg_as_text = base64.b64encode(buffer).decode("utf-8")
 
             await websocket.send_text(jpg_as_text)
 
-            await asyncio.sleep(0.005)  # ~30 FPS
+            await asyncio.sleep(0.03)
 
     except WebSocketDisconnect:
         print(f"[INFO] WebSocket disconnected for camera {cam_id}")
