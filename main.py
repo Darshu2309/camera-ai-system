@@ -4,6 +4,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from ptz_controller import PTZController
+from database import init_db
+init_db()
 import asyncio
 import asyncio
 import base64
