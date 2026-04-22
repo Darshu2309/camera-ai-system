@@ -13,7 +13,7 @@ import math
 
 MAX_CAMERAS = 12
 PTZ_MODE = "simulation"   # change to "real" later
-
+frame_buffer = {}
 import cv2
 import json
 import os
@@ -171,7 +171,8 @@ def ai_worker():
             with state_lock:
                 results[cam_id] = {
                     "objects": detections,
-                    "alert": alert
+                    "alert": alert,
+                    "frame": processed_frame
                 }
 
         time.sleep(0.03)
@@ -188,42 +189,15 @@ def render_frame(cam_id):
         _, buffer = cv2.imencode(".jpg", blank)
         return buffer.tobytes()
 
-    frame = stream.raw_frame.copy()
-
     with state_lock:
-        data = results.get(cam_id, {"objects": [], "alert": False})
-        objs = data["objects"]
-        alert = data["alert"]
+        data = results.get(cam_id)
 
-    # ✅ DRAW OBJECTS (FIXED — ADD BOX)
-    for obj in objs:
-        x1, y1, x2, y2 = obj["bbox"]
-        label = obj["label"]
+    if data and "frame" in data:
+        frame = data["frame"]
+    else:
+        frame = stream.raw_frame.copy()
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        cv2.putText(frame, label, (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-    # 🚨 ALERT DISPLAY
-    if alert:
-        cv2.putText(frame, "🚨 PERSON MOVING",
-                    (50, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0, 0, 255),
-                    3)
-
-        cv2.rectangle(frame, (0, 0),
-                      (frame.shape[1], frame.shape[0]),
-                      (0, 0, 255), 4)
-
-    _, buffer = cv2.imencode(
-        ".jpg",
-        frame,
-        [int(cv2.IMWRITE_JPEG_QUALITY), 60]
-    )
-
+    _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
     return buffer.tobytes()
 
 def calculate_ptz(camera, target):

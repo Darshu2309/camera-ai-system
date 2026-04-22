@@ -2,49 +2,37 @@ from ultralytics import YOLO
 import cv2
 import requests
 import time
+import supervision as sv
 
-from geometry import calculate_angles
-from camera_api import get_camera_by_id
-
-# 🔥 Load model
+# ---------------- MODEL ----------------
 model = YOLO("yolo26l.pt")
 
-# APIs
-MOVE_API = "http://localhost:8000/move_to"
-ALERT_API = "http://localhost:9001/alert"
-
-# Memory
-locked_targets = {}
+# ---------------- GLOBAL ----------------
+trackers = {}
 last_positions = {}
 last_alert_time = {}
+last_detections_cache = {}
 
-# Config
-LOCK_TIMEOUT = 2
-ALERT_COOLDOWN = 5
-
-# Dangerous objects list (extend later)
-DANGER_OBJECTS = ["knife", "scissors", "gun"]
+ALERT_API = "http://localhost:9001/alert"
+ALERT_COOLDOWN = 3
+MOVE_THRESHOLD = 5
 
 
-# ---------------- PTZ CONTROL ----------------
-def send_move(camera_id, x, y):
-    try:
-        requests.post(MOVE_API, json={
-            "camera_id": camera_id,
-            "target": {"x": float(x), "y": float(y), "z": 0}
-        }, timeout=0.2)
-    except:
-        pass
+# ---------------- TRACKER ----------------
+def get_tracker(camera_id):
+    if camera_id not in trackers:
+        trackers[camera_id] = sv.ByteTrack()
+    return trackers[camera_id]
 
 
-# ---------------- ALERT SYSTEM ----------------
+# ---------------- ALERT ----------------
 def send_alert(camera_id, frame):
-    _, img_encoded = cv2.imencode('.jpg', frame)
+    _, img = cv2.imencode(".jpg", frame)
 
     try:
         requests.post(
             ALERT_API,
-            files={"file": ("alert.jpg", img_encoded.tobytes(), "image/jpeg")},
+            files={"file": ("alert.jpg", img.tobytes(), "image/jpeg")},
             data={"camera_id": camera_id},
             timeout=2
         )
@@ -52,164 +40,110 @@ def send_alert(camera_id, frame):
         print("ALERT ERROR:", e)
 
 
-# ---------------- MAIN DETECTOR ----------------
-def detect_objects(frame, camera_id=1):
+# ---------------- MAIN ----------------
+def detect_objects(frame, camera_id):
 
-    small = cv2.resize(frame, (640, 360))
-    results = model(small, conf=0.3)
+    tracker = get_tracker(camera_id)
 
-    detections = []
+    results = model(frame, conf=0.3)[0]
+    detections = sv.Detections.from_ultralytics(results)
 
-    h, w = frame.shape[:2]
-    scale_x = w / 640
-    scale_y = h / 360
-
-    current_time = time.time()
-    alert = False
-
-    # ---------------- DETECTION ----------------
-    for r in results:
-        for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-            x1 = int(x1 * scale_x)
-            y1 = int(y1 * scale_y)
-            x2 = int(x2 * scale_x)
-            y2 = int(y2 * scale_y)
-
-            cls = int(box.cls[0])
-            label = model.names[cls]
-
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
-
-            detections.append({
-                "label": label,
-                "bbox": [x1, y1, x2, y2],
-                "center": [cx, cy]
-            })
-
-    # ---------------- CLASSIFY OBJECTS ----------------
-    persons = []
-    threats = []
-
-    for d in detections:
-        if d["label"] == "person":
-            persons.append(d)
-
-        if d["label"] in DANGER_OBJECTS:
-            threats.append(d)
-
-    # ---------------- PERSON TRACKING ----------------
-    moving_person = None
-    locked = locked_targets.get(camera_id)
-
-    if persons:
-        if locked:
-            lx, ly = locked["center"]
-
-            def dist(p):
-                cx, cy = p["center"]
-                return ((cx - lx)**2 + (cy - ly)**2) ** 0.5
-
-            candidate = min(persons, key=dist)
-
-            if dist(candidate) < 100:
-                moving_person = candidate
-
-        if moving_person is None:
-            moving_person = max(
-                persons,
-                key=lambda p: (p["bbox"][2] - p["bbox"][0]) *
-                              (p["bbox"][3] - p["bbox"][1])
-            )
-
-        locked_targets[camera_id] = {
-            "center": moving_person["center"],
-            "last_seen": current_time
-        }
-
+    # CACHE (prevents flicker)
+    if len(detections) > 0:
+        last_detections_cache[camera_id] = detections
     else:
-        if locked and current_time - locked["last_seen"] > LOCK_TIMEOUT:
-            locked_targets.pop(camera_id, None)
+        detections = last_detections_cache.get(camera_id, detections)
 
-    # ---------------- MOTION DETECTION ----------------
-    if moving_person:
-        cx, cy = moving_person["center"]
+    detections = tracker.update_with_detections(detections)
 
-        prev = last_positions.get(camera_id)
+    moving_ids = set()
+
+    # ---------------- MOVEMENT ----------------
+    for i in range(len(detections)):
+        x1, y1, x2, y2 = detections.xyxy[i]
+        class_id = detections.class_id[i]
+        tracker_id = detections.tracker_id[i]
+
+        if tracker_id is None:
+            continue
+
+        label = model.names[class_id]
+
+        if label != "person":
+            continue
+
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+
+        key = (camera_id, tracker_id)
+        prev = last_positions.get(key)
 
         if prev:
             dx = abs(cx - prev[0])
             dy = abs(cy - prev[1])
 
-            if dx > 5 or dy > 5:
-                alert = True
+            if dx > MOVE_THRESHOLD or dy > MOVE_THRESHOLD:
+                moving_ids.add(tracker_id)
 
-        last_positions[camera_id] = (cx, cy)
+        last_positions[key] = (cx, cy)
 
-        # ---------------- GEOMETRY ----------------
-        cam = get_camera_by_id(camera_id)
-        if cam:
-            new_pan, new_tilt = calculate_angles(cx, cy, w, h, cam)
-            print(f"🎯 Camera {camera_id} → PAN: {new_pan:.2f}, TILT: {new_tilt:.2f}")
+    # ---------------- DRAW ----------------
+    for i in range(len(detections)):
+        x1, y1, x2, y2 = map(int, detections.xyxy[i])
+        class_id = detections.class_id[i]
+        tracker_id = detections.tracker_id[i] or 0
 
-    # ---------------- DRAWING ----------------
-    for d in detections:
-        x1, y1, x2, y2 = d["bbox"]
-        label = d["label"]
+        label = model.names[class_id]
 
-        color = (0, 255, 0)  # default green
+        color = (0, 255, 0)
+        text = label.upper()
 
-        # Moving person
-        if moving_person and d == moving_person:
-            color = (0, 0, 255) if alert else (255, 0, 0)
+        if label == "person":
+            if tracker_id in moving_ids:
+                color = (0, 0, 255)
+                text = "PERSON MOVING"
+            else:
+                color = (0, 255, 0)
+                text = "PERSON"
 
-        # Dangerous object
-        if label in DANGER_OBJECTS:
-            color = (0, 0, 255)
+        # BOX
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        # LABEL BACKGROUND
+        (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(frame, (x1, y1 - h - 10), (x1 + w + 10, y1), color, -1)
 
-        cv2.putText(
-            frame,
-            label.upper(),
-            (x1, y1 - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2
-        )
+        # LABEL TEXT
+        cv2.putText(frame, text, (x1 + 5, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2)
 
-    # ---------------- ALERT TEXT ----------------
-    if alert:
-        cv2.putText(
-            frame,
-            "🚨 PERSON MOVEMENT DETECTED",
-            (50, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 0, 255),
-            3
-        )
+    # ---------------- ALERT ----------------
+    alert = None
 
-    if threats:
-        cv2.putText(
-            frame,
-            "⚠️ DANGEROUS OBJECT DETECTED",
-            (50, 90),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 0, 255),
-            3
-        )
+    if len(moving_ids) > 0:
+        alert = "PERSON MOVEMENT DETECTED"
 
-    # ---------------- ALERT TRIGGER ----------------
+        cv2.putText(frame,
+                    alert,
+                    (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.2,
+                    (0, 0, 255),
+                    4)
+
+        cv2.rectangle(frame,
+                      (0, 0),
+                      (frame.shape[1], frame.shape[0]),
+                      (0, 0, 255),
+                      5)
+
+    # ---------------- SEND ALERT ----------------
     last_time = last_alert_time.get(camera_id, 0)
 
-    if (alert or threats) and (time.time() - last_time > ALERT_COOLDOWN):
-        print("🚨 ALERT TRIGGERED")
+    if alert and time.time() - last_time > ALERT_COOLDOWN:
+        print(f"🚨 ALERT Camera {camera_id}")
         send_alert(camera_id, frame.copy())
         last_alert_time[camera_id] = time.time()
 
-    return frame, detections, alert
+    return frame, [], alert
