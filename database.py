@@ -1,18 +1,20 @@
 import psycopg2
 from datetime import datetime
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DB_CONFIG = {
-    "dbname": "surveillance",
-    "user": "postgres",
-    "password": "Darshu123#",
-    "host": "localhost",
-    "port": "5000"
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "host": os.getenv("DB_HOST"),
+    "port": os.getenv("DB_PORT"),
 }
-
 
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
-
 
 def init_db():
     conn = get_conn()
@@ -33,7 +35,6 @@ def init_db():
     cursor.close()
     conn.close()
 
-
 def insert_image(camera_id, file_path, labels, count):
     conn = get_conn()
     cursor = conn.cursor()
@@ -41,18 +42,11 @@ def insert_image(camera_id, file_path, labels, count):
     cursor.execute("""
     INSERT INTO images (camera_id, timestamp, file_path, labels, count)
     VALUES (%s, %s, %s, %s, %s)
-    """, (
-        camera_id,
-        datetime.now(),
-        file_path,
-        labels,
-        count
-    ))
+    """, (camera_id, datetime.now(), file_path, labels, count))
 
     conn.commit()
     cursor.close()
     conn.close()
-
 
 def get_all_images():
     conn = get_conn()

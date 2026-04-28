@@ -1,16 +1,15 @@
+image: python:3.10-slim
+
 stages:
   - test
-
-variables:
-  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
 
 before_script:
   - python --version
   - pip install --upgrade pip
-  - pip install -r requirements.txt
+  - pip install fastapi uvicorn opencv-python
 
 test:
   stage: test
   script:
-    - python -m py_compile backend/main.py
-    - echo "Basic syntax check passed"
+    - python -m py_compile main.py
+    - echo "CI passed (lightweight)"
