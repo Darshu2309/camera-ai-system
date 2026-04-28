@@ -6,6 +6,15 @@ from pydantic import BaseModel
 from ptz_controller import PTZController
 from database import init_db
 init_db()
+from lidar_service import read_lidar
+from lidar_processing import cluster_lidar
+from fusion_engine import fuse
+from camera_selector import select_best_camera
+from behavior import check_loitering, check_intrusion
+import requests
+lidar_objects = []
+lidar_data = []
+import requests
 import asyncio
 import asyncio
 import base64
@@ -165,19 +174,99 @@ def ai_worker():
             if frame is None:
                 continue
 
-            # 🔥 UPDATED (added alert)
+            # 🔹 1. DETECTION
             processed_frame, detections, alert = detect_objects(frame, cam_id)
 
+            # 🔹 2. FILTER ONLY PERSONS
+            persons = []
+            for det in detections:
+                if det.get("label") == "person":
+                    persons.append(det)
+
+            # 🔹 3. GET TARGET (USE CAMERA DETECTION CENTER)
+            target = None
+
+            if persons:
+                x1, y1, x2, y2 = persons[0]["bbox"]
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+
+                # normalize to small coordinate system (fake world)
+                target = {
+                    "x": cx / 100,
+                    "y": cy / 100,
+                    "z": 0
+                }
+
+            # 🔹 4. OPTIONAL LIDAR FUSION (if available)
+            try:
+                current_lidar = lidar_data.copy()
+                fused_objects = fuse(persons, current_lidar)
+
+                if fused_objects:
+                    target = {
+                        "x": fused_objects[0]["position"][0],
+                        "y": fused_objects[0]["position"][1],
+                        "z": 0
+                    }
+            except:
+                pass
+
+            # 🔹 5. BEHAVIOR LOGIC
+            final_alert = alert
+
+            if target:
+                if check_intrusion([target["x"], target["y"], 0]):
+                    final_alert = "🚨 INTRUSION DETECTED"
+
+                if check_loitering(cam_id, [target["x"], target["y"], 0]):
+                    final_alert = "⚠️ LOITERING DETECTED"
+
+            # 🔹 6. CAMERA SELECTION (FIXED)
+            selected_cam_id = cam_id
+
+            if target:
+                try:
+                    best_cam = select_best_camera(cameras, target)
+                    if best_cam:
+                        selected_cam_id = best_cam["id"]
+                        print(f"[SELECTED CAMERA] {selected_cam_id}")
+                except Exception as e:
+                    print("Camera selection error:", e)
+
+            # 🔹 7. POINT API (USE SELECTED CAMERA ✅ FIX)
+            if target:
+                try:
+                    requests.post(
+                        "http://localhost:8000/point",
+                        json={
+                            "camera_id": selected_cam_id,  # 🔥 FIXED
+                            "target": target,
+                            "mode": "track"
+                        },
+                        timeout=0.2
+                    )
+                except Exception as e:
+                    print("Point API error:", e)
+
+            # 🔹 8. STORE RESULTS
             with state_lock:
                 results[cam_id] = {
                     "objects": detections,
-                    "alert": alert,
+                    "alert": final_alert,
                     "frame": processed_frame
                 }
 
         time.sleep(0.03)
 
-# ---------------- FRAME ----------------
+def lidar_worker():
+    global lidar_objects
+
+    while True:
+        points = read_lidar()
+        lidar_objects = cluster_lidar(points)
+        time.sleep(0.1)
+        
 # ---------------- FRAME ----------------
 def render_frame(cam_id):
     stream = streams.get(cam_id)
@@ -243,6 +332,11 @@ class MoveRequest(BaseModel):
 
 class DeleteRequest(BaseModel):
     id: int
+
+class PointRequest(BaseModel):
+    camera_id: int
+    target: Position
+    mode: str = "direct"
 
 # 🔥 SINGLE FRAME
 @app.get("/frame/{cam_id}")
@@ -337,6 +431,39 @@ async def delete_camera(req: DeleteRequest):
 
     return {"status": "deleted"}
 
+class PointRequest(BaseModel):
+    camera_id: int
+    target: Position
+    mode: str = "direct"
+
+
+@app.post("/point")
+async def point_api(data: PointRequest):
+    cam = next((c for c in cameras if c["id"] == data.camera_id), None)
+
+    if not cam:
+        raise HTTPException(404, "Camera not found")
+
+    target = data.target.dict()
+
+    ptz = calculate_ptz(cam, target)
+
+    pan = max(min(ptz["pan"] / 180, 1), -1)
+    tilt = max(min(ptz["tilt"] / 90, 1), -1)
+
+    print(f"""
+===== POINT API =====
+Camera: {data.camera_id}
+Mode: {data.mode}
+Target: {target}
+
+Pan: {ptz['pan']}°
+Tilt: {ptz['tilt']}°
+====================
+""")
+
+    return {"status": "simulated", "ptz": ptz}
+
 @app.post("/move_to")
 async def move_to(data: MoveRequest):
     try:
@@ -421,7 +548,9 @@ def home():
 async def startup():
     load_cameras()
     init_streams()
+
     threading.Thread(target=ai_worker, daemon=True).start()
+    threading.Thread(target=lidar_worker, daemon=True).start()
 
 @app.websocket("/ws/{cam_id}")
 async def websocket_stream(websocket: WebSocket, cam_id: int):

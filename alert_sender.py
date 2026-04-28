@@ -1,12 +1,13 @@
 import smtplib
 from email.message import EmailMessage
 import os
-import serial
-import time
+from dotenv import load_dotenv
 
-EMAIL_SENDER = "nsridarshan@gmail.com"
-EMAIL_PASSWORD = "tjyc ujmu pfel vxeb"
-EMAIL_RECEIVER = "nsridarshan@gmail.com"
+load_dotenv()
+
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVER = EMAIL_SENDER
 
 
 def send_email_alert(image_path, camera_id):
@@ -17,15 +18,13 @@ def send_email_alert(image_path, camera_id):
 
     msg.set_content(f"Motion detected on Camera {camera_id}")
 
-    # Attach image
     with open(image_path, 'rb') as f:
-        img_data = f.read()
-        msg.add_attachment(img_data, maintype='image', subtype='jpeg', filename=os.path.basename(image_path))
+        msg.add_attachment(f.read(), maintype='image', subtype='jpeg', filename=os.path.basename(image_path))
 
     try:
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
             smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
             smtp.send_message(msg)
-        print("📧 Email alert sent")
+        print("📧 Email sent")
     except Exception as e:
         print("EMAIL ERROR:", e)

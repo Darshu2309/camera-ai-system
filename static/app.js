@@ -97,7 +97,7 @@ async function loadCameraList() {
                 <td>${cam.name || ""}</td>
                 <td>${cam.ip}</td>
                 <td>${cam.username}</td>
-                <td>${cam.password}</td>
+                <td>$....</td>
                 <td>${cam.rtsp_url || ""}</td>
                 <td>
                     <button onclick="deleteCamera(${cam.id})">Delete</button>
