@@ -1,35 +1,27 @@
 stages:
 
-- lint
-- test
+* lint
+* test
 
 image: python:3.10
 
 before_script:
 
-- pip install --upgrade pip
-- pip install -r requirements.txt
-
-# 🔹 Linting (code quality)
+* pip install --upgrade pip
+* pip install -r requirements.txt
 
 lint:
 stage: lint
 script:
 - pip install flake8
 - flake8 .
-allow_failure: false
-
-# 🔹 Basic test (syntax + import check)
 
 test:
 stage: test
 script:
 - python -m compileall .
-allow_failure: false
-
-# 🔹 Run only on branches + merge requests
 
 workflow:
 rules:
-- if: $CI_PIPELINE_SOURCE == "merge_request_event"
-- if: $CI_COMMIT_BRANCH
+- if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+- if: '$CI_COMMIT_BRANCH'
