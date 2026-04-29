@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+
+<html>
+<head>
+    <title>Camera Map</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+```
+<!-- Leaflet CSS -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+
+<style>
+    #map { height: 100vh; }
+</style>
+```
+
+</head>
+<body>
+
+<div id="map"></div>
+
+<!-- Leaflet JS -->
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+<script>
+    // Initialize map
+    var map = L.map('map').setView([20, 0], 2);
+
+    // Base map
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: 'Map data © OpenStreetMap'
+    }).addTo(map);
+
+    // Dummy camera data (you will replace later)
+    const cameras = [
+        { id: 1, lat: 20, lng: 78 },
+        { id: 2, lat: 21, lng: 79 },
+        { id: 3, lat: 19.5, lng: 77.5 }
+    ];
+
+    // Add markers
+    cameras.forEach(cam => {
+        const marker = L.marker([cam.lat, cam.lng]).addTo(map);
+        marker.bindPopup("Camera ID: " + cam.id);
+    });
+
+    // Click on map
+    map.on('click', function(e) {
+        const { lat, lng } = e.latlng;
+
+        console.log("Clicked:", lat, lng);
+
+        // Send to backend
+        fetch("http://localhost:8000/point", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                camera_id: 1,
+                target: { x: lat, y: lng, z: 0 },
+                mode: "manual"
+            })
+        });
+    });
+
+</script>
+
+</body>
+</html>

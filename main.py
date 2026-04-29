@@ -1,28 +1,8 @@
-﻿from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi import WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
-from ptz_controller import PTZController
-from database import init_db
-init_db()
-from lidar_service import read_lidar
-from lidar_processing import cluster_lidar
-from fusion_engine import fuse
-from camera_selector import select_best_camera
-from behavior import check_loitering, check_intrusion
+﻿# CLEAN IMPORTS (NO DUPLICATES)
 import requests
-lidar_objects = []
-lidar_data = []
-import requests
-import asyncio
 import asyncio
 import base64
 import math
-
-MAX_CAMERAS = 12
-PTZ_MODE = "simulation"   # change to "real" later
-frame_buffer = {}
 import cv2
 import json
 import os
@@ -30,10 +10,25 @@ import socket
 import threading
 import time
 import numpy as np
+
 from pathlib import Path
 from urllib.parse import quote
 
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from ptz_controller import PTZController
+from database import init_db
 from detector import detect_objects
+from lidar_service import read_lidar
+from lidar_processing import cluster_lidar
+from fusion_engine import fuse
+from camera_selector import select_best_camera
+from behavior import check_loitering, check_intrusion
+lidar_data = []
+PTZ_MODE = "simulation"
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|max_delay;0"
 
@@ -55,12 +50,9 @@ def load_camera_store():
         CAMERAS_FILE.write_text("[]")
         return []
     return json.loads(CAMERAS_FILE.read_text())
-    def init_camera_defaults():
-        """Initialize default camera if store is empty"""
 
 def save_camera_store(data):
     CAMERAS_FILE.write_text(json.dumps(data, indent=4))
-
 
 def load_cameras():
     global cameras
@@ -124,7 +116,11 @@ class CameraStream:
 
             self.cap.grab()
 
-            ret, frame = self.cap.read()
+            try:
+                ret, frame = self.cap.read()
+            except Exception:
+                self.connect()
+                continue
 
             if ret:
                 frame = cv2.resize(frame, (960, 540))
@@ -175,7 +171,11 @@ def ai_worker():
                 continue
 
             # 🔹 1. DETECTION
-            processed_frame, detections, alert = detect_objects(frame, cam_id)
+            try:
+                processed_frame, detections, alert = detect_objects(frame, cam_id)
+            except Exception as e:
+                print("[AI ERROR]", e)
+                continue
 
             # 🔹 2. FILTER ONLY PERSONS
             persons = []
@@ -263,8 +263,12 @@ def lidar_worker():
     global lidar_objects
 
     while True:
-        points = read_lidar()
-        lidar_objects = cluster_lidar(points)
+        try:
+            points = read_lidar()
+            lidar_objects = cluster_lidar(points)
+        except Exception as e:
+            print("[LIDAR ERROR]", e)
+
         time.sleep(0.1)
         
 # ---------------- FRAME ----------------
@@ -284,7 +288,7 @@ def render_frame(cam_id):
     if data and "frame" in data:
         frame = data["frame"]
     else:
-        frame = stream.raw_frame.copy()
+        frame = stream.raw_frame.copy() if stream.raw_frame is not None else None
 
     _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
     return buffer.tobytes()
@@ -430,12 +434,6 @@ async def delete_camera(req: DeleteRequest):
     init_streams()
 
     return {"status": "deleted"}
-
-class PointRequest(BaseModel):
-    camera_id: int
-    target: Position
-    mode: str = "direct"
-
 
 @app.post("/point")
 async def point_api(data: PointRequest):
