@@ -1,50 +1,72 @@
 import math
 
+
+def calculate_distance(cam_pos, target):
+    dx = target["x"] - cam_pos["x"]
+    dy = target["y"] - cam_pos["y"]
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def calculate_angle(cam_pos, target):
+    dx = target["x"] - cam_pos["x"]
+    dy = target["y"] - cam_pos["y"]
+    return math.degrees(math.atan2(dy, dx))
+
+
+def angle_difference(a1, a2):
+    diff = abs(a1 - a2) % 360
+    return min(diff, 360 - diff)
+
+
+def is_in_fov(camera, target_angle):
+    cam_pan = camera["orientation"]["pan"]
+    fov = camera.get("fov", 90)
+
+    diff = angle_difference(cam_pan, target_angle)
+
+    return diff <= (fov / 2)
+
+
 def select_best_camera(cameras, target):
-    best_cam = None
+    best_camera = None
     best_score = float("inf")
 
     for cam in cameras:
-        try:
-            # 🔹 Camera position
-            cx = cam["position"]["x"]
-            cy = cam["position"]["y"]
+        if cam.get("status", "active") != "active":
+            continue
 
-            # 🔹 Camera orientation (default if missing)
-            pan = cam.get("orientation", {}).get("pan", 0)
-            fov = cam.get("fov", 90)
+        cam_pos = cam.get("position", {"x": 0, "y": 0})
 
-            # 🔹 Target difference
-            dx = target["x"] - cx
-            dy = target["y"] - cy
+        distance = calculate_distance(cam_pos, target)
+        angle = calculate_angle(cam_pos, target)
 
-            distance = math.sqrt(dx**2 + dy**2)
+        # Check if target is inside FOV
+        if not is_in_fov(cam, angle):
+            continue
 
-            # 🔹 Angle to target
-            target_angle = math.degrees(math.atan2(dy, dx))
+        # Score = distance + angle penalty
+        cam_pan = cam["orientation"]["pan"]
+        angle_diff = angle_difference(cam_pan, angle)
 
-            # 🔹 Angle difference
-            angle_diff = abs(target_angle - pan)
-            if angle_diff > 180:
-                angle_diff = 360 - angle_diff
+        score = distance + (angle_diff * 0.5)
 
-            # 🔹 Angle penalty (smaller is better)
-            angle_penalty = angle_diff / 180  # normalize
+        if score < best_score:
+            best_score = score
+            best_camera = cam
 
-            # 🔹 Visibility (inside FOV or not)
-            if angle_diff <= fov / 2:
-                visibility = 0   # good
-            else:
-                visibility = 5   # bad (penalty)
+    # 🔥 Fallback: if no camera in FOV → choose nearest
+    if best_camera is None:
+        min_dist = float("inf")
 
-            # 🔹 Final score
-            score = distance + angle_penalty * 5 + visibility
+        for cam in cameras:
+            cam_pos = cam.get("position", {"x": 0, "y": 0})
+            distance = calculate_distance(cam_pos, target)
 
-            if score < best_score:
-                best_score = score
-                best_cam = cam
+            if distance < min_dist:
+                min_dist = distance
+                best_camera = cam
 
-        except Exception as e:
-            print("Camera selection error:", e)
+    if best_camera:
+        print(f"[SELECTED CAMERA] {best_camera['id']} (score={round(best_score,2)})")
 
-    return best_cam
+    return best_camera

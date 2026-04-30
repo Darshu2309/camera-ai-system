@@ -13,9 +13,11 @@ import numpy as np
 
 from pathlib import Path
 from urllib.parse import quote
+from datetime import datetime
+
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -84,12 +86,29 @@ class CameraStream:
     def __init__(self, cam):
         self.cam = cam
         self.cap = None
-        self.frame = None        # processed frame (optional)
-        self.raw_frame = None    # 🔥 NEW (for live stream)
+
+        self.frame = None
+        self.raw_frame = None
+
         self.running = True
+
+        # 🔥 Recording settings
+        self.recording = True
+        self.writer = None
+        self.last_rotation = time.time()
+        self.record_duration = 600  # 10 minutes
+
+        self.width = 960
+        self.height = 540
+
         self.connect()
+        self.start_new_recording()
+
         threading.Thread(target=self.update, daemon=True).start()
 
+    # =========================
+    # CONNECT CAMERA
+    # =========================
     def connect(self):
         if self.cap:
             self.cap.release()
@@ -99,14 +118,51 @@ class CameraStream:
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         ok, frame = self.cap.read()
+
         if ok:
-            self.cap = self.cap
+            self.height, self.width = frame.shape[:2]
             self.raw_frame = frame
-            print(f"[INFO] Connected camera {self.cam['id']}")
+            print(f"[INFO] Connected camera {self.cam['id']} ({self.width}x{self.height})")
         else:
             self.cap = None
             print(f"[WARN] No stream for camera {self.cam['id']}")
 
+    # =========================
+    # START RECORDING FILE
+    # =========================
+    def start_new_recording(self):
+        try:
+            folder = f"recordings/cam_{self.cam['id']}"
+            os.makedirs(folder, exist_ok=True)
+
+            filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.avi")
+            path = os.path.join(folder, filename)
+
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+
+            self.writer = cv2.VideoWriter(
+                path,
+                fourcc,
+                20.0,
+                (self.width, self.height)
+            )
+
+            if not self.writer.isOpened():
+                print("[ERROR] VideoWriter failed to open")
+                self.writer = None
+                return
+
+            self.last_rotation = time.time()
+
+            print(f"[REC] Recording started: {path}")
+
+        except Exception as e:
+            print("[REC ERROR]", e)
+            self.writer = None
+
+    # =========================
+    # UPDATE LOOP
+    # =========================
     def update(self):
         while self.running:
             if not self.cap:
@@ -123,21 +179,49 @@ class CameraStream:
                 continue
 
             if ret:
-                frame = cv2.resize(frame, (960, 540))
+                # 🔥 IMPORTANT: resize MUST match writer size
+                frame = cv2.resize(frame, (self.width, self.height))
                 self.raw_frame = frame
+
+                # 🔥 WRITE FRAME
+                if self.recording and self.writer:
+                    try:
+                        self.writer.write(frame)
+                    except Exception as e:
+                        print("[WRITE ERROR]", e)
+
+                # 🔥 ROTATE FILE EVERY 10 MIN
+                if self.recording:
+                    if time.time() - self.last_rotation > self.record_duration:
+                        if self.writer:
+                            self.writer.release()
+
+                        self.start_new_recording()
+
             else:
                 self.connect()
 
-        # 🔥 VERY FAST LOOP
-            time.sleep(0.015)  # fast refresh
+            time.sleep(0.015)
 
+    # =========================
+    # READ FRAME
+    # =========================
     def read(self):
         return None if self.raw_frame is None else self.raw_frame.copy()
 
+    # =========================
+    # STOP STREAM
+    # =========================
     def stop(self):
         self.running = False
+
         if self.cap:
             self.cap.release()
+
+        if self.writer:
+            self.writer.release()
+
+        print(f"[INFO] Camera {self.cam['id']} stopped")
 
 # ---------------- STREAM MANAGER ----------------
 def init_streams():
@@ -240,7 +324,6 @@ def ai_worker():
                     requests.post(
                         "http://localhost:8000/point",
                         json={
-                            "camera_id": selected_cam_id,  # 🔥 FIXED
                             "target": target,
                             "mode": "track"
                         },
@@ -435,23 +518,60 @@ async def delete_camera(req: DeleteRequest):
 
     return {"status": "deleted"}
 
+@app.get("/history/{camera_id}")
+def get_history(camera_id: int):
+    folder = f"recordings/cam_{camera_id}"
+
+    if not os.path.exists(folder):
+        return []
+
+    files = sorted(os.listdir(folder), reverse=True)
+
+    return files
+
+@app.get("/history/{camera_id}/{filename}")
+def get_video(camera_id: int, filename: str):
+    path = f"recordings/cam_{camera_id}/{filename}"
+
+    if not os.path.exists(path):
+        raise HTTPException(404, "File not found")
+
+    return FileResponse(path, media_type="video/mp4")
+
 @app.post("/point")
 async def point_api(data: PointRequest):
-    cam = next((c for c in cameras if c["id"] == data.camera_id), None)
-
-    if not cam:
-        raise HTTPException(404, "Camera not found")
 
     target = data.target.dict()
 
+    # 🔥 STEP 1 — AUTO SELECT CAMERA (only if not provided or mode=track)
+    if data.mode == "track" or data.camera_id is None:
+        selected_cam = select_best_camera(cameras, target)
+
+        if not selected_cam:
+            raise HTTPException(status_code=404, detail="No suitable camera found")
+
+        cam = selected_cam
+        camera_id = cam["id"]
+
+    else:
+        # 🔹 Manual camera mode (your existing behavior preserved)
+        cam = next((c for c in cameras if c["id"] == data.camera_id), None)
+
+        if not cam:
+            raise HTTPException(status_code=404, detail="Camera not found")
+
+        camera_id = data.camera_id
+
+    # 🔥 STEP 2 — PTZ CALCULATION (unchanged)
     ptz = calculate_ptz(cam, target)
 
     pan = max(min(ptz["pan"] / 180, 1), -1)
     tilt = max(min(ptz["tilt"] / 90, 1), -1)
 
+    # 🔥 STEP 3 — DEBUG PRINT (improved)
     print(f"""
 ===== POINT API =====
-Camera: {data.camera_id}
+Camera: {camera_id}
 Mode: {data.mode}
 Target: {target}
 
@@ -460,7 +580,12 @@ Tilt: {ptz['tilt']}°
 ====================
 """)
 
-    return {"status": "simulated", "ptz": ptz}
+    # 🔥 STEP 4 — RESPONSE (added camera_id for clarity)
+    return {
+        "status": "simulated",
+        "camera_id": camera_id,
+        "ptz": ptz
+    }
 
 @app.post("/move_to")
 async def move_to(data: MoveRequest):
