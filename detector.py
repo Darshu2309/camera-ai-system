@@ -14,7 +14,7 @@ last_alert_time = {}
 last_detections_cache = {}
 
 ALERT_API = "http://localhost:9001/alert"
-ALERT_COOLDOWN = 3
+ALERT_COOLDOWN = 2
 MOVE_THRESHOLD = 5
 
 
@@ -57,10 +57,11 @@ def detect_objects(frame, camera_id):
     detections = tracker.update_with_detections(detections)
 
     moving_ids = set()
+    formatted_detections = []
 
-    # ---------------- MOVEMENT ----------------
+    # ---------------- PROCESS ----------------
     for i in range(len(detections)):
-        x1, y1, x2, y2 = detections.xyxy[i]
+        x1, y1, x2, y2 = map(int, detections.xyxy[i])
         class_id = detections.class_id[i]
         tracker_id = detections.tracker_id[i]
 
@@ -69,81 +70,63 @@ def detect_objects(frame, camera_id):
 
         label = model.names[class_id]
 
-        if label != "person":
-            continue
+        # STORE DETECTION ✅
+        formatted_detections.append({
+            "label": label,
+            "bbox": [x1, y1, x2, y2],
+            "tracker_id": int(tracker_id)
+        })
 
-        cx = int((x1 + x2) / 2)
-        cy = int((y1 + y2) / 2)
+        # MOVEMENT CHECK (only for person)
+        if label == "person":
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
 
-        key = (camera_id, tracker_id)
-        prev = last_positions.get(key)
+            key = (camera_id, tracker_id)
+            prev = last_positions.get(key)
 
-        if prev:
-            dx = abs(cx - prev[0])
-            dy = abs(cy - prev[1])
+            if prev:
+                dx = abs(cx - prev[0])
+                dy = abs(cy - prev[1])
 
-            if dx > MOVE_THRESHOLD or dy > MOVE_THRESHOLD:
-                moving_ids.add(tracker_id)
+                if dx > MOVE_THRESHOLD or dy > MOVE_THRESHOLD:
+                    moving_ids.add(tracker_id)
 
-        last_positions[key] = (cx, cy)
+            last_positions[key] = (cx, cy)
 
     # ---------------- DRAW ----------------
-    for i in range(len(detections)):
-        x1, y1, x2, y2 = map(int, detections.xyxy[i])
-        class_id = detections.class_id[i]
-        tracker_id = detections.tracker_id[i] or 0
-
-        label = model.names[class_id]
+    for det in formatted_detections:
+        x1, y1, x2, y2 = det["bbox"]
+        label = det["label"]
 
         color = (0, 255, 0)
         text = label.upper()
 
         if label == "person":
-            if tracker_id in moving_ids:
-                color = (0, 0, 255)
-                text = "PERSON MOVING"
-            else:
-                color = (0, 255, 0)
-                text = "PERSON"
+            color = (0, 0, 255)
+            text = "PERSON MOVING"
 
-        # BOX
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
 
-        # LABEL BACKGROUND
         (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
         cv2.rectangle(frame, (x1, y1 - h - 10), (x1 + w + 10, y1), color, -1)
 
-        # LABEL TEXT
         cv2.putText(frame, text, (x1 + 5, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (255, 255, 255), 2)
 
-    # ---------------- ALERT ----------------
     alert = None
 
     if len(moving_ids) > 0:
         alert = "PERSON MOVEMENT DETECTED"
 
-        cv2.putText(frame,
-                    alert,
-                    (30, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
-                    (0, 0, 255),
-                    4)
+        last_time = last_alert_time.get(camera_id, 0)
 
-        cv2.rectangle(frame,
-                      (0, 0),
-                      (frame.shape[1], frame.shape[0]),
-                      (0, 0, 255),
-                      5)
+        if time.time() - last_time > ALERT_COOLDOWN:
+            print(f"🚨 ALERT Camera {camera_id}")
 
-    # ---------------- SEND ALERT ----------------
-    last_time = last_alert_time.get(camera_id, 0)
+            send_alert(camera_id, frame.copy())
 
-    if alert and time.time() - last_time > ALERT_COOLDOWN:
-        print(f"🚨 ALERT Camera {camera_id}")
-        send_alert(camera_id, frame.copy())
-        last_alert_time[camera_id] = time.time()
+            last_alert_time[camera_id] = time.time()
 
-    return frame, [], alert
+    return frame, formatted_detections, alert

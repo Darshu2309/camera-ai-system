@@ -17,7 +17,7 @@ def execute_camera_action(action_data):
     elif move == "center":
         camera_state["pan"] = 0
 
-    time.sleep(0.01)
+    time.sleep(0.1)
 
     return {
         "status": "ok",

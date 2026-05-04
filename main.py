@@ -1,4 +1,7 @@
 ﻿# CLEAN IMPORTS (NO DUPLICATES)
+from storage import get_video_url
+from storage import upload_file, delete_local
+
 import requests
 import asyncio
 import base64
@@ -24,13 +27,22 @@ from pydantic import BaseModel
 from ptz_controller import PTZController
 from database import init_db
 from detector import detect_objects
-from lidar_service import read_lidar
-from lidar_processing import cluster_lidar
-from fusion_engine import fuse
+from command_controller import parse_command, execute_command
+# from lidar_service import read_lidar
+# from lidar_processing import cluster_lidar
+# from fusion_engine import fuse
 from camera_selector import select_best_camera
 from behavior import check_loitering, check_intrusion
+from camera_selector import initialize_camera_orientations
 lidar_data = []
+streams = {}
 PTZ_MODE = "simulation"
+PTZ_LIMITS = {
+    "pan": (-90, 90),
+    "tilt": (-45, 45),
+    "zoom": (0, 10)
+}
+
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|max_delay;0"
 
@@ -58,22 +70,36 @@ def save_camera_store(data):
 
 def load_cameras():
     global cameras
+
     cameras = load_camera_store()
 
-    # 🔥 Ensure all cameras have metadata
+    # 🔥 Safety check (VERY IMPORTANT)
+    if not cameras:
+        print("[WARN] No cameras found, initializing empty list")
+        cameras = []
+
+    # 🔥 Ensure all cameras have required metadata
     for cam in cameras:
         if "position" not in cam:
-            cam["position"] = {"x": 0, "y": 0, "z": 0}
+            cam["position"] = {"x": 0.0, "y": 0.0, "z": 0.0}
 
         if "orientation" not in cam:
-            cam["orientation"] = {"pan": 0, "tilt": 0, "zoom": 1}
+            cam["orientation"] = {"pan": 0.0, "tilt": 0.0, "zoom": 1.0}
 
         if "fov" not in cam:
-            cam["fov"] = 90
+            cam["fov"] = 90.0
+
+        if "status" not in cam:
+            cam["status"] = "active"
 
     print(f"[INFO] Loaded {len(cameras)} cameras with metadata")
 
+    # 🔥 CRITICAL FIX → RETURN
+    return cameras
 
+cameras = load_cameras()
+
+initialize_camera_orientations(cameras)
 # ---------------- RTSP ----------------
 def build_rtsp_url(cam):
     password = quote(cam.get("password", ""), safe="")
@@ -95,8 +121,10 @@ class CameraStream:
         # 🔥 Recording settings
         self.recording = True
         self.writer = None
+        self.current_file = None
         self.last_rotation = time.time()
-        self.record_duration = 600  # 10 minutes
+
+        self.record_duration = 600  # 🔥 change to 10 for testing
 
         self.width = 960
         self.height = 540
@@ -148,10 +176,11 @@ class CameraStream:
             )
 
             if not self.writer.isOpened():
-                print("[ERROR] VideoWriter failed to open")
+                print("[ERROR] VideoWriter failed")
                 self.writer = None
                 return
 
+            self.current_file = path
             self.last_rotation = time.time()
 
             print(f"[REC] Recording started: {path}")
@@ -159,6 +188,36 @@ class CameraStream:
         except Exception as e:
             print("[REC ERROR]", e)
             self.writer = None
+
+    # =========================
+    # ROTATE RECORDING
+    # =========================
+    def rotate_recording(self):
+        try:
+            print(f"[ROTATE] Rotating file for camera {self.cam['id']}")
+
+            if self.writer:
+                self.writer.release()
+
+            # 🔥 Upload previous file
+            if self.current_file and os.path.exists(self.current_file):
+                print(f"[UPLOAD] Uploading: {self.current_file}")
+
+                uploaded = upload_file(self.current_file)
+
+                if uploaded:
+                    delete_local(self.current_file)
+                else:
+                    print("[UPLOAD FAILED] File not uploaded")
+
+            else:
+                print("[WARN] No file to upload")
+
+            # 🔥 Start new recording
+            self.start_new_recording()
+
+        except Exception as e:
+            print("[ROTATION ERROR]", e)
 
     # =========================
     # UPDATE LOOP
@@ -179,7 +238,6 @@ class CameraStream:
                 continue
 
             if ret:
-                # 🔥 IMPORTANT: resize MUST match writer size
                 frame = cv2.resize(frame, (self.width, self.height))
                 self.raw_frame = frame
 
@@ -190,13 +248,10 @@ class CameraStream:
                     except Exception as e:
                         print("[WRITE ERROR]", e)
 
-                # 🔥 ROTATE FILE EVERY 10 MIN
+                # 🔥 ROTATE FILE
                 if self.recording:
                     if time.time() - self.last_rotation > self.record_duration:
-                        if self.writer:
-                            self.writer.release()
-
-                        self.start_new_recording()
+                        self.rotate_recording()
 
             else:
                 self.connect()
@@ -220,6 +275,15 @@ class CameraStream:
 
         if self.writer:
             self.writer.release()
+
+        # 🔥 Upload last file
+        if self.current_file and os.path.exists(self.current_file):
+            print(f"[STOP UPLOAD] Uploading last file: {self.current_file}")
+
+            uploaded = upload_file(self.current_file)
+
+            if uploaded:
+                delete_local(self.current_file)
 
         print(f"[INFO] Camera {self.cam['id']} stopped")
 
@@ -245,7 +309,6 @@ def init_streams():
 
 
 # ---------------- AI ----------------
-# ---------------- AI ----------------
 def ai_worker():
     while True:
         for cam_id, stream in list(streams.items()):
@@ -254,71 +317,80 @@ def ai_worker():
             if frame is None:
                 continue
 
-            # 🔹 1. DETECTION
+            # =========================
+            # 1. DETECTION
+            # =========================
             try:
                 processed_frame, detections, alert = detect_objects(frame, cam_id)
             except Exception as e:
                 print("[AI ERROR]", e)
                 continue
 
-            # 🔹 2. FILTER ONLY PERSONS
+            # =========================
+            # 2. FILTER PERSONS (SAFE)
+            # =========================
             persons = []
-            for det in detections:
-                if det.get("label") == "person":
-                    persons.append(det)
 
-            # 🔹 3. GET TARGET (USE CAMERA DETECTION CENTER)
+            for det in detections:
+                try:
+                    if det.get("label") == "person":
+                        persons.append(det)
+                except Exception:
+                    continue
+
+            # =========================
+            # 3. GET TARGET
+            # =========================
             target = None
 
             if persons:
-                x1, y1, x2, y2 = persons[0]["bbox"]
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
+                try:
+                    x1, y1, x2, y2 = persons[0]["bbox"]
 
-                # normalize to small coordinate system (fake world)
-                target = {
-                    "x": cx / 100,
-                    "y": cy / 100,
-                    "z": 0
-                }
+                    cx = (x1 + x2) / 2
+                    cy = (y1 + y2) / 2
 
-            # 🔹 4. OPTIONAL LIDAR FUSION (if available)
-            try:
-                current_lidar = lidar_data.copy()
-                fused_objects = fuse(persons, current_lidar)
-
-                if fused_objects:
                     target = {
-                        "x": fused_objects[0]["position"][0],
-                        "y": fused_objects[0]["position"][1],
+                        "x": cx / 100,
+                        "y": cy / 100,
                         "z": 0
                     }
-            except:
-                pass
+                except Exception as e:
+                    print("[TARGET ERROR]", e)
 
-            # 🔹 5. BEHAVIOR LOGIC
+            # =========================
+            # 4. BEHAVIOR LOGIC
+            # =========================
             final_alert = alert
 
             if target:
-                if check_intrusion([target["x"], target["y"], 0]):
-                    final_alert = "🚨 INTRUSION DETECTED"
+                try:
+                    if check_intrusion([target["x"], target["y"], 0]):
+                        final_alert = "🚨 INTRUSION DETECTED"
 
-                if check_loitering(cam_id, [target["x"], target["y"], 0]):
-                    final_alert = "⚠️ LOITERING DETECTED"
+                    if check_loitering(cam_id, [target["x"], target["y"], 0]):
+                        final_alert = "⚠️ LOITERING DETECTED"
+                except Exception as e:
+                    print("[BEHAVIOR ERROR]", e)
 
-            # 🔹 6. CAMERA SELECTION (FIXED)
+            # =========================
+            # 5. CAMERA SELECTION
+            # =========================
             selected_cam_id = cam_id
 
             if target:
                 try:
                     best_cam = select_best_camera(cameras, target)
+
                     if best_cam:
                         selected_cam_id = best_cam["id"]
                         print(f"[SELECTED CAMERA] {selected_cam_id}")
                 except Exception as e:
-                    print("Camera selection error:", e)
+                    print("[CAM SELECT ERROR]", e)
 
-            # 🔹 7. POINT API (USE SELECTED CAMERA ✅ FIX)
+            # =========================
+            # 6. POINT API (TRACK)
+            # =========================
             if target:
                 try:
                     requests.post(
@@ -330,9 +402,11 @@ def ai_worker():
                         timeout=0.2
                     )
                 except Exception as e:
-                    print("Point API error:", e)
+                    print("[POINT API ERROR]", e)
 
-            # 🔹 8. STORE RESULTS
+            # =========================
+            # 7. STORE RESULTS
+            # =========================
             with state_lock:
                 results[cam_id] = {
                     "objects": detections,
@@ -342,17 +416,17 @@ def ai_worker():
 
         time.sleep(0.03)
 
-def lidar_worker():
-    global lidar_objects
+# def lidar_worker():
+#    global lidar_objects
 
-    while True:
-        try:
-            points = read_lidar()
-            lidar_objects = cluster_lidar(points)
-        except Exception as e:
-            print("[LIDAR ERROR]", e)
+#    while True:
+#        try:
+#            points = read_lidar()
+#            lidar_objects = cluster_lidar(points)
+#        except Exception as e:
+#            print("[LIDAR ERROR]", e)
 
-        time.sleep(0.1)
+#       time.sleep(0.1) 
         
 # ---------------- FRAME ----------------
 def render_frame(cam_id):
@@ -421,9 +495,12 @@ class DeleteRequest(BaseModel):
     id: int
 
 class PointRequest(BaseModel):
-    camera_id: int
-    target: Position
-    mode: str = "direct"
+    target: dict
+    mode: str = "auto"
+
+class CommandRequest(BaseModel):
+    command: str
+    mode: str = "auto"
 
 # 🔥 SINGLE FRAME
 @app.get("/frame/{cam_id}")
@@ -536,56 +613,45 @@ def get_video(camera_id: int, filename: str):
     if not os.path.exists(path):
         raise HTTPException(404, "File not found")
 
-    return FileResponse(path, media_type="video/mp4")
+    return FileResponse(path, media_type="video/avi")
 
 @app.post("/point")
 async def point_api(data: PointRequest):
+    try:
+        target = data.target
 
-    target = data.target.dict()
+        # 🔥 VALIDATION
+        if not cameras:
+            raise HTTPException(status_code=400, detail="No cameras available")
 
-    # 🔥 STEP 1 — AUTO SELECT CAMERA (only if not provided or mode=track)
-    if data.mode == "track" or data.camera_id is None:
+        # 🔥 AUTO SELECT CAMERA
         selected_cam = select_best_camera(cameras, target)
 
         if not selected_cam:
             raise HTTPException(status_code=404, detail="No suitable camera found")
 
-        cam = selected_cam
-        camera_id = cam["id"]
+        # 🔥 PTZ CALCULATION
+        ptz = calculate_ptz(selected_cam, target)
 
-    else:
-        # 🔹 Manual camera mode (your existing behavior preserved)
-        cam = next((c for c in cameras if c["id"] == data.camera_id), None)
-
-        if not cam:
-            raise HTTPException(status_code=404, detail="Camera not found")
-
-        camera_id = data.camera_id
-
-    # 🔥 STEP 2 — PTZ CALCULATION (unchanged)
-    ptz = calculate_ptz(cam, target)
-
-    pan = max(min(ptz["pan"] / 180, 1), -1)
-    tilt = max(min(ptz["tilt"] / 90, 1), -1)
-
-    # 🔥 STEP 3 — DEBUG PRINT (improved)
-    print(f"""
-===== POINT API =====
-Camera: {camera_id}
-Mode: {data.mode}
+        print(f"""
+===== AUTO CAMERA SELECTION =====
+Selected Camera: {selected_cam['id']}
 Target: {target}
 
 Pan: {ptz['pan']}°
 Tilt: {ptz['tilt']}°
-====================
+================================
 """)
 
-    # 🔥 STEP 4 — RESPONSE (added camera_id for clarity)
-    return {
-        "status": "simulated",
-        "camera_id": camera_id,
-        "ptz": ptz
-    }
+        return {
+            "status": "auto-selected",
+            "camera_id": selected_cam["id"],
+            "ptz": ptz
+        }
+
+    except Exception as e:
+        print("[ERROR /point]", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/move_to")
 async def move_to(data: MoveRequest):
@@ -651,6 +717,108 @@ Tilt: {tilt}
         print("PTZ ERROR:", e)
         raise HTTPException(500, str(e))
 
+@app.post("/command")
+def handle_command(req: CommandRequest):
+    try:
+        parsed = parse_command(req.command)
+
+        result = execute_command(
+            parsed,
+            streams,
+            cameras,
+            results,
+            mode=req.mode   # ✅ FIXED
+        )
+
+        return result
+
+    except Exception as e:
+        print("[COMMAND ERROR]", e)
+        return {"error": str(e)}
+    
+@app.post("/discover-cameras")
+def discover():
+    from camera_discovery import auto_discover_and_register
+    auto_discover_and_register()
+    return {"status": "discovery completed"}
+
+@app.post("/athena/ptztest")
+async def ptz_test(data: dict):
+    try:
+        camera_id = data.get("camera_id")
+        pan = data.get("pan", 0)
+        tilt = data.get("tilt", 0)
+        zoom = data.get("zoom", 1)
+
+        # 🔍 Find camera
+        cam = next((c for c in cameras if c["id"] == camera_id), None)
+
+        if not cam:
+            raise HTTPException(404, "Camera not found")
+
+        cam_type = cam.get("type", "fixed")
+
+        # =========================
+        # VALIDATION
+        # =========================
+        if not (PTZ_LIMITS["pan"][0] <= pan <= PTZ_LIMITS["pan"][1]):
+            raise HTTPException(400, "Pan out of range (-90 to 90)")
+
+        if not (PTZ_LIMITS["tilt"][0] <= tilt <= PTZ_LIMITS["tilt"][1]):
+            raise HTTPException(400, "Tilt out of range (-45 to 45)")
+
+        if not (PTZ_LIMITS["zoom"][0] <= zoom <= PTZ_LIMITS["zoom"][1]):
+            raise HTTPException(400, "Zoom out of range (0 to 10)")
+
+        # =========================
+        # FIXED CAMERA BEHAVIOR
+        # =========================
+        if cam_type == "fixed":
+            return {
+                "camera_id": camera_id,
+                "status": "fixed_camera",
+                "message": "PTZ not supported",
+                "ptz": cam.get("orientation", {"pan": 0, "tilt": 0, "zoom": 1}),
+                "limits": PTZ_LIMITS
+            }
+
+        # =========================
+        # PTZ CAMERA (FUTURE)
+        # =========================
+        else:
+            # 🔥 Update internal state
+            cam["orientation"]["pan"] = pan
+            cam["orientation"]["tilt"] = tilt
+            cam["orientation"]["zoom"] = zoom
+
+            # 🔥 (Future) send ONVIF command here
+
+            return {
+                "camera_id": camera_id,
+                "status": "moved",
+                "ptz": {
+                    "pan": pan,
+                    "tilt": tilt,
+                    "zoom": zoom
+                },
+                "limits": PTZ_LIMITS
+            }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.get("/play/{filename}")
+def play(filename: str):
+    url = get_video_url(filename)
+
+    if not url:
+        raise HTTPException(404, "File not found")
+
+    return {"url": url}
+
 # 🔥 FIXED HOME
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -673,7 +841,7 @@ async def startup():
     init_streams()
 
     threading.Thread(target=ai_worker, daemon=True).start()
-    threading.Thread(target=lidar_worker, daemon=True).start()
+    #threading.Thread(target=lidar_worker, daemon=True).start()
 
 @app.websocket("/ws/{cam_id}")
 async def websocket_stream(websocket: WebSocket, cam_id: int):
@@ -737,3 +905,57 @@ async def websocket_stream(websocket: WebSocket, cam_id: int):
 
     except WebSocketDisconnect:
         print(f"[INFO] WebSocket disconnected for camera {cam_id}")
+
+async def handle_focus_command(command):
+    import re
+
+    target_type = None
+    camera_id = None
+
+    if "person" in command:
+        target_type = "person"
+
+    match = re.search(r"camera\s*(\d+)", command)
+    if match:
+        camera_id = int(match.group(1))
+
+    if not target_type:
+        return {"status": "error", "message": "No target specified"}
+
+    if camera_id is None:
+        return {"status": "error", "message": "No camera specified"}
+
+    # 🔥 GET STREAM
+    stream = streams.get(camera_id)
+
+    if not stream:
+        return {"status": "error", "message": f"Camera {camera_id} not active"}
+
+    frame = stream.read()
+
+    if frame is None:
+        return {"status": "error", "message": "No frame from camera"}
+
+    # 🔥 DETECTION
+    try:
+        from detector import detect_objects
+        detections = detect_objects(frame, camera_id, return_targets=True)
+    except Exception as e:
+        return {"status": "error", "message": f"Detection failed: {str(e)}"}
+
+    if not detections:
+        return {"status": "no target found"}
+
+    target = detections[0]
+
+    from camera_selector import select_best_camera
+    selected_cam = select_best_camera(cameras, target)
+
+    if not selected_cam:
+        return {"status": "error", "message": "No suitable camera found"}
+
+    return {
+        "status": "focused",
+        "camera_id": selected_cam["id"],
+        "target": target
+    }
