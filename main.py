@@ -1,12 +1,9 @@
-﻿# CLEAN IMPORTS (NO DUPLICATES)
-from storage import get_video_url
-from storage import upload_file, delete_local
-
-import requests
+﻿import requests
 import asyncio
 import base64
 import math
 import cv2
+cv2.setNumThreads(1)
 import json
 import os
 import socket
@@ -16,7 +13,7 @@ import numpy as np
 
 from pathlib import Path
 from urllib.parse import quote
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -31,10 +28,9 @@ from command_controller import parse_command, execute_command
 # from lidar_service import read_lidar
 # from lidar_processing import cluster_lidar
 # from fusion_engine import fuse
-from camera_selector import select_best_camera
+from camera_selector import select_best_camera, initialize_camera_orientations
 from behavior import check_loitering, check_intrusion
-from camera_selector import initialize_camera_orientations
-lidar_data = []
+from camera_health import camera_health, HEALTH_TIMEOUT
 streams = {}
 PTZ_MODE = "simulation"
 PTZ_LIMITS = {
@@ -50,7 +46,12 @@ BASE_DIR = Path(__file__).resolve().parent
 CAMERAS_FILE = BASE_DIR / "cameras.json"
 
 app = FastAPI()
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+app.mount(
+    "/static",
+    StaticFiles(directory=os.path.join(BASE_DIR, "static")),
+    name="static"
+)
+print("STATIC PATH:", os.path.abspath("static"))
 
 cameras = []
 streams = {}
@@ -117,12 +118,14 @@ class CameraStream:
         self.raw_frame = None
 
         self.running = True
+        self.lock = threading.Lock()
 
         # 🔥 Recording settings
         self.recording = True
         self.writer = None
         self.current_file = None
         self.last_rotation = time.time()
+        self.last_frame_time = time.time()
 
         self.record_duration = 600  # 🔥 change to 10 for testing
 
@@ -153,7 +156,20 @@ class CameraStream:
             print(f"[INFO] Connected camera {self.cam['id']} ({self.width}x{self.height})")
         else:
             self.cap = None
-            print(f"[WARN] No stream for camera {self.cam['id']}")
+            print(f"[ERROR] Failed to connect camera {self.cam['id']} → {url}")
+
+        print(f"[RTSP] {url}")
+
+        if ok:
+            camera_health[self.cam["id"]] = {
+                "last_seen": time.time(),
+                "status": "active"
+            }
+        else:
+            camera_health[self.cam["id"]] = {
+                "status": "inactive",
+                "reason": "Connection failed"
+            }
 
     # =========================
     # START RECORDING FILE
@@ -188,58 +204,35 @@ class CameraStream:
         except Exception as e:
             print("[REC ERROR]", e)
             self.writer = None
-
-    # =========================
-    # ROTATE RECORDING
-    # =========================
-    def rotate_recording(self):
-        try:
-            print(f"[ROTATE] Rotating file for camera {self.cam['id']}")
-
-            if self.writer:
-                self.writer.release()
-
-            # 🔥 Upload previous file
-            if self.current_file and os.path.exists(self.current_file):
-                print(f"[UPLOAD] Uploading: {self.current_file}")
-
-                uploaded = upload_file(self.current_file)
-
-                if uploaded:
-                    delete_local(self.current_file)
-                else:
-                    print("[UPLOAD FAILED] File not uploaded")
-
-            else:
-                print("[WARN] No file to upload")
-
-            # 🔥 Start new recording
-            self.start_new_recording()
-
-        except Exception as e:
-            print("[ROTATION ERROR]", e)
-
     # =========================
     # UPDATE LOOP
     # =========================
     def update(self):
         while self.running:
-            if not self.cap:
+            if not self.running:
+                break
+            if not self.cap or not self.cap.isOpened():
                 self.connect()
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
 
-            self.cap.grab()
-
             try:
+                self.cap.grab()
                 ret, frame = self.cap.read()
-            except Exception:
+            except Exception as e:
+                print(f"[STREAM ERROR] Camera {self.cam['id']}:", e)
                 self.connect()
                 continue
 
             if ret:
                 frame = cv2.resize(frame, (self.width, self.height))
                 self.raw_frame = frame
+                self.last_frame_time = time.time()
+
+                camera_health[self.cam["id"]] = {
+                    "last_seen": time.time(),
+                    "status": "active"
+                }
 
                 # 🔥 WRITE FRAME
                 if self.recording and self.writer:
@@ -251,12 +244,18 @@ class CameraStream:
                 # 🔥 ROTATE FILE
                 if self.recording:
                     if time.time() - self.last_rotation > self.record_duration:
-                        self.rotate_recording()
+                        self.start_new_recording()
 
             else:
+                camera_health[self.cam["id"]] = {
+                    "last_seen": camera_health.get(self.cam["id"], {}).get("last_seen", 0),
+                    "status": "inactive",
+                    "reason": "Frame read failed"
+                }
+
                 self.connect()
 
-            time.sleep(0.015)
+            time.sleep(0.03)
 
     # =========================
     # READ FRAME
@@ -268,25 +267,27 @@ class CameraStream:
     # STOP STREAM
     # =========================
     def stop(self):
+        print(f"[STOP] Camera {self.cam['id']} stopping...")
+
         self.running = False
 
-        if self.cap:
-            self.cap.release()
+        time.sleep(0.2)
 
-        if self.writer:
-            self.writer.release()
+        try:
+            if self.cap and self.cap.isOpened():
+                self.cap.release()
+        except Exception as e:
+            print("[STOP ERROR]", e)
 
-        # 🔥 Upload last file
-        if self.current_file and os.path.exists(self.current_file):
-            print(f"[STOP UPLOAD] Uploading last file: {self.current_file}")
+        try:
+            if self.writer:
+                self.writer.release()
+        except Exception:
+            pass
 
-            uploaded = upload_file(self.current_file)
-
-            if uploaded:
-                delete_local(self.current_file)
+        self.cap = None
 
         print(f"[INFO] Camera {self.cam['id']} stopped")
-
 # ---------------- STREAM MANAGER ----------------
 def init_streams():
     global streams
@@ -297,8 +298,9 @@ def init_streams():
     # stop removed
     for cam_id in list(old_streams.keys()):
         if cam_id not in new_ids:
-            old_streams[cam_id].stop()
-            del old_streams[cam_id]
+            if hasattr(old_streams[cam_id], "stop"):
+                old_streams[cam_id].stop()
+                del old_streams[cam_id]
 
     streams = old_streams
 
@@ -307,6 +309,43 @@ def init_streams():
         if cam["id"] not in streams:
             streams[cam["id"]] = CameraStream(cam)
 
+def validate_camera_connection(cam):
+    url = build_rtsp_url(cam)
+
+    print(f"[VALIDATE RTSP] {url}")
+
+    # -------------------------------
+    # 1. CHECK IP REACHABILITY
+    # -------------------------------
+    try:
+        socket.create_connection((cam["ip"], 554), timeout=2)
+    except Exception:
+        return False, "Camera not reachable (wrong IP or offline)"
+
+    # -------------------------------
+    # 2. TRY RTSP CONNECTION
+    # -------------------------------
+    try:
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret or frame is None:
+            return False, "Invalid username or password"
+
+        return True, "OK"
+
+    except Exception as e:
+        msg = str(e)
+
+        if "401" in msg:
+            return False, "Unauthorized (wrong username or password)"
+        if "403" in msg:
+            return False, "Access denied by camera"
+
+        return False, "RTSP connection failed"
 
 # ---------------- AI ----------------
 def ai_worker():
@@ -394,12 +433,12 @@ def ai_worker():
             if target:
                 try:
                     requests.post(
-                        "http://localhost:8000/point",
+                        "http://127.0.0.1:8000/point",
                         json={
                             "target": target,
                             "mode": "track"
                         },
-                        timeout=0.2
+                        timeout=2
                     )
                 except Exception as e:
                     print("[POINT API ERROR]", e)
@@ -414,7 +453,7 @@ def ai_worker():
                     "frame": processed_frame
                 }
 
-        time.sleep(0.03)
+        time.sleep(0.01)
 
 # def lidar_worker():
 #    global lidar_objects
@@ -449,6 +488,46 @@ def render_frame(cam_id):
 
     _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
     return buffer.tobytes()
+
+def to_ist(timestamp):
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(ist).strftime("%Y-%m-%d %H:%M:%S")
+
+def classify_camera_health():
+    active = []
+    inactive = []
+
+    now = time.time()
+
+    for cam in cameras:
+        cam_id = cam["id"]
+
+        health = camera_health.get(cam_id)
+
+        if not health:
+            inactive.append({
+                "camera_id": cam_id,
+                "status": "inactive",
+                "reason": "No data yet"
+            })
+            continue
+
+        last_seen = health.get("last_seen", 0)
+
+        if now - last_seen <= HEALTH_TIMEOUT:
+            active.append({
+                "camera_id": cam_id,
+                "status": "active",
+                "last_seen_ist": to_ist(last_seen)
+            })
+        else:
+            inactive.append({
+                "camera_id": cam_id,
+                "status": "inactive",
+                "reason": "Timeout"
+            })
+
+    return active, inactive
 
 def calculate_ptz(camera, target):
     cam_pos = camera["position"]
@@ -541,15 +620,55 @@ def get_cameras():
 def status():
     return {"status": "running"}
 
+@app.get("/camera-health")
+def camera_health_api():
+    active, inactive = classify_camera_health()
+
+    return {
+        "total_cameras": len(cameras),
+        "active_count": len(active),
+        "inactive_count": len(inactive),
+        "active_cameras": active,
+        "inactive_cameras": inactive
+    }
+
 
 @app.post("/add_camera")
 async def add_camera(req: CameraCreate):
     cams = load_camera_store()
 
+    # -------------------------------
+    # DUPLICATE CHECK
+    # -------------------------------
     for cam in cams:
         if cam["ip"] == req.ip:
-            raise HTTPException(400, "Camera already exists")
+            raise HTTPException(status_code=400, detail="Camera already exists")
 
+    # -------------------------------
+    # TEMP CAMERA FOR VALIDATION
+    # -------------------------------
+    temp_cam = {
+        "id": -1,
+        "ip": req.ip,
+        "username": req.username,
+        "password": req.password,
+        "rtsp_url": getattr(req, "rtsp_url", "")
+    }
+
+    # -------------------------------
+    # VALIDATE CONNECTION (CRITICAL)
+    # -------------------------------
+    is_valid, message = validate_camera_connection(temp_cam)
+
+    if not is_valid:
+        raise HTTPException(
+            status_code=400,
+            detail=message
+        )
+
+    # -------------------------------
+    # CREATE CAMERA
+    # -------------------------------
     new_id = max([c["id"] for c in cams], default=0) + 1
 
     cam = {
@@ -559,7 +678,10 @@ async def add_camera(req: CameraCreate):
         "username": req.username,
         "password": req.password,
 
-        # 🔥 NEW METADATA
+        # 🔥 OPTIONAL RTSP SUPPORT
+        "rtsp_url": getattr(req, "rtsp_url", ""),
+
+        # 🔥 METADATA
         "position": {
             "x": req.position.x,
             "y": req.position.y,
@@ -573,13 +695,23 @@ async def add_camera(req: CameraCreate):
         "fov": req.fov
     }
 
+    # -------------------------------
+    # SAVE
+    # -------------------------------
     cams.append(cam)
     save_camera_store(cams)
 
     cameras.append(cam)
-    init_streams()
 
-    return {"status": "added", "camera": cam}
+    try:
+        init_streams()
+    except Exception as e:
+        print("[STREAM INIT ERROR]", e)
+
+    return {
+        "status": "added",
+        "camera": cam
+    }
 
 
 @app.post("/delete_camera")
@@ -810,29 +942,10 @@ async def ptz_test(data: dict):
             "message": str(e)
         }
 
-@app.get("/play/{filename}")
-def play(filename: str):
-    url = get_video_url(filename)
-
-    if not url:
-        raise HTTPException(404, "File not found")
-
-    return {"url": url}
-
 # 🔥 FIXED HOME
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def home():
-    try:
-        file_path = BASE_DIR / "static" / "index.html"
-
-        if not file_path.exists():
-            return HTMLResponse("<h1>index.html not found</h1>", status_code=500)
-
-        return HTMLResponse(file_path.read_text(encoding="utf-8"))
-
-    except Exception as e:
-        return HTMLResponse(f"<h1>Error</h1><p>{str(e)}</p>", status_code=500)
-
+    return FileResponse(BASE_DIR / "static" / "index.html")
 
 # ---------------- START ----------------
 @app.on_event("startup")
@@ -845,7 +958,10 @@ async def startup():
 
 @app.websocket("/ws/{cam_id}")
 async def websocket_stream(websocket: WebSocket, cam_id: int):
-    await websocket.accept()
+    try:
+        await websocket.accept()
+    except Exception:
+        return  # 🔥 prevents crash if already closed
 
     try:
         while True:
@@ -857,31 +973,23 @@ async def websocket_stream(websocket: WebSocket, cam_id: int):
 
             frame = stream.raw_frame.copy()
 
-            h, w = frame.shape[:2]
-            cam_center = (w // 2, h // 2)
-
-            cv2.circle(frame, cam_center, 5, (0, 255, 0), -1)
-
             with state_lock:
                 data = results.get(cam_id, {"objects": [], "alert": False})
-                objs = data["objects"]
-                alert = data["alert"]
+                objs = data.get("objects", [])
+                alert = data.get("alert", False)
 
-            # ✅ DRAW OBJECTS (CLEAN)
             for obj in objs:
-                x1, y1, x2, y2 = obj["bbox"]
-                label = obj["label"]
+                try:
+                    x1, y1, x2, y2 = obj["bbox"]
+                    label = obj.get("label", "obj")
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, label, (x1, y1 - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (0, 255, 0), 2)
+                except:
+                    continue
 
-                cv2.putText(frame, label,
-                            (x1, y1 - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 255, 0),
-                            2)
-
-            # 🚨 ALERT
             if alert:
                 cv2.putText(frame, "PERSON MOVEMENT DETECTED",
                             (50, 50),
@@ -890,21 +998,29 @@ async def websocket_stream(websocket: WebSocket, cam_id: int):
                             (0, 0, 255),
                             3)
 
-                cv2.rectangle(frame, (0, 0),
-                              (frame.shape[1], frame.shape[0]),
-                              (0, 0, 255), 4)
+            success, buffer = cv2.imencode(
+                ".jpg", frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 75]
+            )
 
-            _, buffer = cv2.imencode(".jpg", frame,
-                                    [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not success:
+                continue
 
-            jpg_as_text = base64.b64encode(buffer).decode("utf-8")
+            jpg = base64.b64encode(buffer).decode("utf-8")
 
-            await websocket.send_text(jpg_as_text)
+            try:
+                await websocket.send_text(jpg)
+            except Exception:
+                break  # 🔥 exit loop cleanly
 
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.08)  # 🔥 reduce load (~12 FPS)
 
     except WebSocketDisconnect:
-        print(f"[INFO] WebSocket disconnected for camera {cam_id}")
+        print(f"[INFO] WS disconnected cam {cam_id}")
+
+    except Exception as e:
+        print(f"[WS ERROR] cam {cam_id}:", e)
+
 
 async def handle_focus_command(command):
     import re

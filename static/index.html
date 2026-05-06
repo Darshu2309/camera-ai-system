@@ -130,7 +130,33 @@
             <h4>Field of View</h4>
             <input id="fov" placeholder="FOV (e.g. 90)">
         </div>
+        <!-- ✅ ERROR BOX -->
+<div id="errorBox" style="
+    color: red;
+    background: #ffe6e6;
+    padding: 8px;
+    border-radius: 5px;
+    margin-bottom: 10px;
+    display: none;
+"></div>
 
+<!-- ✅ SUCCESS BOX -->
+<div id="successBox" style="
+    color: green;
+    background: #e6ffe6;
+    padding: 8px;
+    border-radius: 5px;
+    margin-bottom: 10px;
+    display: none;
+"></div>
+
+<!-- ✅ LOADING SPINNER -->
+<div id="loader" style="
+    display: none;
+    margin-bottom: 10px;
+">
+    🔄 Connecting to camera...
+</div>
         <button onclick="addCamera()">Submit</button>
     </div>
 

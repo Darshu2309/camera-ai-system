@@ -13,15 +13,15 @@ last_positions = {}
 last_alert_time = {}
 last_detections_cache = {}
 
-ALERT_API = "http://localhost:9001/alert"
+ALERT_API = "http://127.0.0.1:9001/alert"
 ALERT_COOLDOWN = 2
-MOVE_THRESHOLD = 5
+MOVE_THRESHOLD = 2
 
 
 # ---------------- TRACKER ----------------
 def get_tracker(camera_id):
     if camera_id not in trackers:
-        trackers[camera_id] = sv.ByteTrack()
+        trackers[camera_id] = sv.ByteTrack(track_activation_threshold=0.25, lost_track_buffer=30)
     return trackers[camera_id]
 
 
