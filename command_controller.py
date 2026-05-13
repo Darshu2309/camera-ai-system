@@ -1,5 +1,5 @@
 import re
-from camera_selector import select_best_camera
+from services.camera_selector import select_best_camera
 
 
 def parse_command(text):

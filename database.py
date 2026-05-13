@@ -1,17 +1,20 @@
 import psycopg2
 from datetime import datetime
+from pathlib import Path
 import os
 from dotenv import load_dotenv
-
-load_dotenv()
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 DB_CONFIG = {
-    "dbname": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "host": os.getenv("DB_HOST"),
-    "port": os.getenv("DB_PORT"),
+    "dbname": "surveillance",
+    "user": "postgres",
+    "password": "Darshu123#",
+    "host": "localhost",
+    "port": "5000",
 }
+
+print(DB_CONFIG)
 
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)

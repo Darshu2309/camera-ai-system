@@ -20,7 +20,7 @@ async def receive_alert(
     camera_id: int = Form(...)
 ):
     try:
-        print(f"\n🚨 ALERT RECEIVED from Camera {camera_id}")
+        print(f"\n- ALERT RECEIVED from Camera {camera_id}")
 
         # 📁 Create camera folder
         cam_folder = os.path.join(SAVE_DIR, f"camera_{camera_id}")
@@ -34,7 +34,7 @@ async def receive_alert(
         with open(file_path, "wb") as f:
             f.write(await file.read())
 
-        print(f"✅ Saved: {file_path}")
+        print(f"- Saved: {file_path}")
 
         # ---------------- BASIC METADATA ----------------
         labels = "person"   # 🔥 later dynamic from detector
@@ -43,7 +43,7 @@ async def receive_alert(
         # ---------------- SAVE TO DATABASE ----------------
         insert_image(camera_id, file_path, labels, count)
 
-        print("📦 Stored in PostgreSQL")
+        print("- Stored in PostgreSQL")
 
         return {
             "status": "saved",

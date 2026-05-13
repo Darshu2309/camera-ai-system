@@ -2,7 +2,7 @@ import requests
 from wsdiscovery.discovery import ThreadedWSDiscovery as WSDiscovery
 
 
-CONFIG_SERVER = "http://localhost:8001/add_camera"
+CONFIG_SERVER = "http://127.0.0.1:8001/add_camera"
 
 
 def discover_onvif_cameras():

@@ -37,59 +37,121 @@ function showAdd() {
 
 // ---------------- LIVE (WEBSOCKET) ----------------
 async function loadLiveCameras() {
+
     try {
-        // 🔥 Fetch cameras + health together
-        const [cameras, health] = await Promise.all([
+
+        const [cameras, health, tracking] = await Promise.all([
+
             fetch("/cameras").then(r => r.json()),
-            fetch("/camera-health").then(r => r.json())
-        ]);
 
-        grid.innerHTML = "";
+            fetch("/camera-health").then(r => r.json()),
 
-        // 🔥 Active camera IDs
+            fetch("/tracking").then(r => r.json())
+        ])
+
+        grid.innerHTML = ""
+
         const activeIds = new Set(
-            (health.active_cameras || []).map(c => c.camera_id)
-        );
+            (health.active_cameras || []).map(
+                c => c.camera_id
+            )
+        )
 
-        // 🔥 Inactive reasons map
-        const inactiveMap = {};
-        (health.inactive_cameras || []).forEach(c => {
-            inactiveMap[c.camera_id] = c.reason || "Inactive";
-        });
+        const inactiveMap = {}
+
+        ;(health.inactive_cameras || []).forEach(c => {
+
+            inactiveMap[c.camera_id] =
+                c.reason || "Inactive"
+        })
 
         cameras.forEach((cam) => {
-            const card = document.createElement("div");
-            card.className = "camera";
 
-            const isActive = activeIds.has(cam.id);
+            const card = document.createElement("div")
 
-            // 🔥 Border color
-            card.style.border = isActive
-                ? "3px solid green"
-                : "3px solid red";
+            card.className = "camera"
 
-            // 🔥 Status text
+            card.dataset.id = cam.id
+
+            const isActive = activeIds.has(cam.id)
+
+            const trackingData = tracking[cam.id]
+
+            // =========================
+            // BORDER COLORS
+            // =========================
+
+            if (trackingData) {
+
+                card.style.border =
+                    "5px solid orange"
+
+            } else {
+
+                card.style.border = isActive
+                    ? "3px solid green"
+                    : "3px solid red"
+            }
+
             const statusText = isActive
                 ? "🟢 ACTIVE"
-                : `🔴 INACTIVE (${inactiveMap[cam.id] || ""})`;
+                : `🔴 INACTIVE (${inactiveMap[cam.id] || ""})`
+
+            const trackingText = trackingData
+                ? `
+                    <div style="
+                        margin-top:6px;
+                        color:orange;
+                        font-weight:bold;
+                        font-size:13px;
+                    ">
+                        🎯 TRACKING:
+                        ${trackingData.target}
+                    </div>
+
+                    <div style="
+                        font-size:11px;
+                        color:#ccc;
+                    ">
+                        Started:
+                        ${trackingData.started_at}
+                    </div>
+                `
+                : ""
 
             card.innerHTML = `
-                <canvas id="cam${cam.id}" width="640" height="360"></canvas>
-                <p>${cam.name || "Camera " + cam.id}</p>
-                <p style="font-size:12px;">${statusText}</p>
-            `;
 
-            grid.appendChild(card);
+                <canvas
+                    id="cam${cam.id}"
+                    width="640"
+                    height="360">
+                </canvas>
 
-            // 🔥 Only start stream if camera is active
+                <p>
+                    ${cam.name || "Camera " + cam.id}
+                </p>
+
+                <p style="font-size:12px;">
+                    ${statusText}
+                </p>
+
+                ${trackingText}
+            `
+
+            grid.appendChild(card)
+
             if (isActive && !sockets[cam.id]) {
-                startWebSocket(cam.id);
+
+                startWebSocket(cam.id)
             }
-        });
+        })
 
     } catch (err) {
-        console.error(err);
-        grid.innerHTML = "Error loading cameras";
+
+        console.error(err)
+
+        grid.innerHTML =
+            "Error loading cameras"
     }
 }
 
@@ -98,25 +160,133 @@ loadLiveCameras(); // run once
 setInterval(updateCameraStatus, 5000);
 
 async function updateCameraStatus() {
+
     try {
-        const health = await fetch("/camera-health").then(r => r.json());
+
+        const [health, tracking] = await Promise.all([
+
+            fetch("/camera-health").then(
+                r => r.json()
+            ),
+
+            fetch("/tracking").then(
+                r => r.json()
+            )
+        ])
 
         const activeIds = new Set(
-            (health.active_cameras || []).map(c => c.camera_id)
-        );
 
-        document.querySelectorAll(".camera").forEach(card => {
-            const camId = parseInt(card.dataset.id);
+            (health.active_cameras || []).map(
+                c => c.camera_id
+            )
+        )
 
-            if (activeIds.has(camId)) {
-                card.style.border = "3px solid green";
-            } else {
-                card.style.border = "3px solid red";
-            }
-        });
+        const inactiveMap = {}
+
+        ;(health.inactive_cameras || []).forEach(c => {
+
+            inactiveMap[c.camera_id] =
+                c.reason || "Inactive"
+        })
+
+        document.querySelectorAll(".camera")
+            .forEach(card => {
+
+                const camId = parseInt(
+                    card.dataset.id
+                )
+
+                const trackingData =
+                    tracking[camId]
+
+                // =====================
+                // TRACKING MODE
+                // =====================
+
+                if (trackingData) {
+
+                    card.style.border =
+                        "5px solid orange"
+
+                }
+
+                // =====================
+                // ACTIVE / INACTIVE
+                // =====================
+
+                else if (activeIds.has(camId)) {
+
+                    card.style.border =
+                        "3px solid green"
+
+                } else {
+
+                    card.style.border =
+                        "3px solid red"
+                }
+
+                // =====================
+                // TRACKING LABEL
+                // =====================
+
+                let badge =
+                    card.querySelector(
+                        ".tracking-ui"
+                    )
+
+                if (trackingData) {
+
+                    if (!badge) {
+
+                        badge =
+                            document.createElement(
+                                "div"
+                            )
+
+                        badge.className =
+                            "tracking-ui"
+
+                        badge.style.marginTop =
+                            "6px"
+
+                        badge.style.color =
+                            "orange"
+
+                        badge.style.fontWeight =
+                            "bold"
+
+                        badge.style.fontSize =
+                            "13px"
+
+                        card.appendChild(badge)
+                    }
+
+                    badge.innerHTML = `
+                        🎯 TRACKING:
+                        ${trackingData.target}
+                        <br>
+
+                        <span style="
+                            font-size:11px;
+                            color:#ccc;
+                        ">
+                            ${trackingData.started_at}
+                        </span>
+                    `
+                }
+
+                else {
+
+                    if (badge) {
+
+                        badge.remove()
+                    }
+                }
+            })
 
     } catch (e) {
-        console.error(e);
+
+        console.error(e)
     }
 }
 
@@ -218,9 +388,9 @@ async function addCamera() {
         rtsp_url: document.getElementById("rtsp").value,
 
         position: {
-            x: parseFloat(document.getElementById("posX").value) || 0,
-            y: parseFloat(document.getElementById("posY").value) || 0,
-            z: parseFloat(document.getElementById("posZ").value) || 0
+            latitude: parseFloat(document.getElementById("latitude").value) || 0,
+            longitude: parseFloat(document.getElementById("longitude").value) || 0,
+            altitude: parseFloat(document.getElementById("altitude").value) || 0
         },
         orientation: {
             pan: parseFloat(document.getElementById("pan").value) || 0,
@@ -276,6 +446,7 @@ async function deleteCamera(id) {
 
 // ---------------- START ----------------
 showLive();
+setInterval(loadLiveCameras, 3000);
 
 async function testMove() {
     const res = await fetch("/move_to", {

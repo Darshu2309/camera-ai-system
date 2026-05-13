@@ -9,7 +9,8 @@ import os
 import socket
 import threading
 import time
-import numpy as np
+import numpy as np;
+
 
 from pathlib import Path
 from urllib.parse import quote
@@ -28,8 +29,13 @@ from command_controller import parse_command, execute_command
 # from lidar_service import read_lidar
 # from lidar_processing import cluster_lidar
 # from fusion_engine import fuse
-from camera_selector import select_best_camera, initialize_camera_orientations
+from services.camera_selector import select_best_camera, initialize_camera_orientations
 from behavior import check_loitering, check_intrusion
+from commands.parser import parse_command
+from commands.validator import validate_command
+from commands.dispatcher import dispatch_command
+from services.tracking_service import tracking_sessions
+from services.geo_service import calculate_bearing
 from camera_health import camera_health, HEALTH_TIMEOUT
 streams = {}
 PTZ_MODE = "simulation"
@@ -413,38 +419,7 @@ def ai_worker():
                     print("[BEHAVIOR ERROR]", e)
 
             # =========================
-            # 5. CAMERA SELECTION
-            # =========================
-            selected_cam_id = cam_id
-
-            if target:
-                try:
-                    best_cam = select_best_camera(cameras, target)
-
-                    if best_cam:
-                        selected_cam_id = best_cam["id"]
-                        print(f"[SELECTED CAMERA] {selected_cam_id}")
-                except Exception as e:
-                    print("[CAM SELECT ERROR]", e)
-
-            # =========================
-            # 6. POINT API (TRACK)
-            # =========================
-            if target:
-                try:
-                    requests.post(
-                        "http://127.0.0.1:8000/point",
-                        json={
-                            "target": target,
-                            "mode": "track"
-                        },
-                        timeout=2
-                    )
-                except Exception as e:
-                    print("[POINT API ERROR]", e)
-
-            # =========================
-            # 7. STORE RESULTS
+            # 5. STORE RESULTS
             # =========================
             with state_lock:
                 results[cam_id] = {
@@ -530,27 +505,30 @@ def classify_camera_health():
     return active, inactive
 
 def calculate_ptz(camera, target):
-    cam_pos = camera["position"]
 
-    dx = target["x"] - cam_pos["x"]
-    dy = target["y"] - cam_pos["y"]
-    dz = target["z"] - cam_pos["z"]
+    position = camera["position"]
 
-    distance_xy = math.sqrt(dx**2 + dy**2)
+    pan = calculate_bearing(
 
-    pan = math.degrees(math.atan2(dy, dx))
-    tilt = math.degrees(math.atan2(dz, distance_xy))
+        position["latitude"],
+        position["longitude"],
+
+        target["latitude"],
+        target["longitude"]
+    )
 
     return {
+
         "pan": round(pan, 2),
-        "tilt": round(tilt, 2),
-        "distance": round(distance_xy, 2)
+
+        "tilt": 0
     }
 
 class Position(BaseModel):
-    x: float
-    y: float
-    z: float
+
+    latitude: float
+
+    longitude: float
 
 class Orientation(BaseModel):
     pan: float
@@ -574,8 +552,10 @@ class DeleteRequest(BaseModel):
     id: int
 
 class PointRequest(BaseModel):
-    target: dict
-    mode: str = "auto"
+
+    latitude: float
+
+    longitude: float
 
 class CommandRequest(BaseModel):
     command: str
@@ -683,9 +663,11 @@ async def add_camera(req: CameraCreate):
 
         # 🔥 METADATA
         "position": {
-            "x": req.position.x,
-            "y": req.position.y,
-            "z": req.position.z,
+
+            "latitude":
+            req.position.latitude,
+            "longitude":
+            req.position.longitude
         },
         "orientation": {
             "pan": req.orientation.pan,
@@ -749,41 +731,110 @@ def get_video(camera_id: int, filename: str):
 
 @app.post("/point")
 async def point_api(data: PointRequest):
+
     try:
-        target = data.target
 
-        # 🔥 VALIDATION
+        target = {
+
+            "latitude": data.latitude,
+
+            "longitude": data.longitude
+        }
+
+        # -----------------------------
+        # VALIDATION
+        # -----------------------------
+
         if not cameras:
-            raise HTTPException(status_code=400, detail="No cameras available")
 
-        # 🔥 AUTO SELECT CAMERA
-        selected_cam = select_best_camera(cameras, target)
+            raise HTTPException(
+
+                status_code=400,
+
+                detail="No cameras available"
+            )
+
+        # -----------------------------
+        # AUTO CAMERA SELECTION
+        # -----------------------------
+
+        selected_cam = select_best_camera(
+
+            cameras,
+
+            target
+        )
 
         if not selected_cam:
-            raise HTTPException(status_code=404, detail="No suitable camera found")
 
-        # 🔥 PTZ CALCULATION
-        ptz = calculate_ptz(selected_cam, target)
+            raise HTTPException(
+
+                status_code=404,
+
+                detail="No suitable camera found"
+            )
+
+        # -----------------------------
+        # PTZ CALCULATION
+        # -----------------------------
+
+        ptz = calculate_ptz(
+
+            selected_cam,
+
+            target
+        )
 
         print(f"""
-===== AUTO CAMERA SELECTION =====
-Selected Camera: {selected_cam['id']}
-Target: {target}
 
-Pan: {ptz['pan']}°
-Tilt: {ptz['tilt']}°
+===== GIS CAMERA SELECTION =====
+
+Selected Camera:
+{selected_cam['id']}
+
+Target:
+{target}
+
+Pan:
+{ptz['pan']}°
+
+Tilt:
+{ptz['tilt']}°
+
 ================================
+
 """)
 
         return {
-            "status": "auto-selected",
-            "camera_id": selected_cam["id"],
-            "ptz": ptz
+
+            "status": "camera_selected",
+
+            "camera_id":
+            selected_cam["id"],
+
+            "camera_name":
+            selected_cam.get("name"),
+
+            "stream_url":
+            selected_cam.get(
+                "stream_url"
+            ),
+
+            "ptz": ptz,
+
+            "target": target
         }
 
     except Exception as e:
+
         print("[ERROR /point]", e)
-        raise HTTPException(status_code=500, detail=str(e))
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=str(e)
+        )
 
 @app.post("/move_to")
 async def move_to(data: MoveRequest):
@@ -848,25 +899,34 @@ Tilt: {tilt}
     except Exception as e:
         print("PTZ ERROR:", e)
         raise HTTPException(500, str(e))
+    
+@app.get("/tracking")
+def get_tracking():
+
+    return tracking_sessions
 
 @app.post("/command")
-def handle_command(req: CommandRequest):
+async def command_api(req: CommandRequest):
+
     try:
+
         parsed = parse_command(req.command)
 
-        result = execute_command(
+        validate_command(parsed, cameras)
+
+        result = dispatch_command(
             parsed,
-            streams,
-            cameras,
-            results,
-            mode=req.mode   # ✅ FIXED
+            cameras
         )
 
         return result
 
     except Exception as e:
-        print("[COMMAND ERROR]", e)
-        return {"error": str(e)}
+
+        return {
+            "status": "error",
+            "message": str(e)
+        }
     
 @app.post("/discover-cameras")
 def discover():
@@ -1064,7 +1124,7 @@ async def handle_focus_command(command):
 
     target = detections[0]
 
-    from camera_selector import select_best_camera
+    from services.camera_selector import select_best_camera
     selected_cam = select_best_camera(cameras, target)
 
     if not selected_cam:
