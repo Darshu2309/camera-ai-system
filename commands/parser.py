@@ -2,163 +2,155 @@ import re
 
 from models.command_models import ParsedCommand
 
+from commands.command_engine import (
+
+    normalize_command,
+
+    detect_intent,
+
+    extract_entities
+)
+
 
 def parse_command(command: str):
 
-    command = command.lower()
+    # =================================================
+    # NORMALIZATION
+    # =================================================
 
-    # -----------------------------
-    # TRACK NEAREST PERSON
-    # -----------------------------
+    command = normalize_command(command)
 
-    if "track nearest person" in command:
+    # =================================================
+    # INTENT
+    # =================================================
 
-        cam_match = re.search(
-            r"camera (\d+)",
-            command
+    intent = detect_intent(command)
+
+    if not intent:
+
+        raise Exception(
+
+            "Intent not detected"
         )
 
-        camera_id = None
+    # =================================================
+    # ENTITIES
+    # =================================================
 
-        if cam_match:
-            camera_id = int(
-                cam_match.group(1)
-            )
+    entities = extract_entities(command)
 
-        return ParsedCommand(
-
-            action="track_nearest_person",
-
-            camera_id=camera_id
-        )
-
-    # -----------------------------
-    # TRACK SUSPICIOUS
-    # -----------------------------
-
-    if "track suspicious" in command:
-
-        cam_match = re.search(
-            r"camera (\d+)",
-            command
-        )
-
-        camera_id = None
-
-        if cam_match:
-            camera_id = int(
-                cam_match.group(1)
-            )
-
-        return ParsedCommand(
-
-            action="track_suspicious",
-
-            camera_id=camera_id
-        )
-
-    # -----------------------------
+    # =================================================
     # MOVE
-    # -----------------------------
+    # =================================================
 
-    move_match = re.search(
-        r"move camera (\d+) (left|right|up|down) (\d+) degrees",
-        command
-    )
-
-    if move_match:
-
-        camera_id = move_match.group(1)
-
-        direction = move_match.group(2)
-
-        angle = move_match.group(3)
+    if intent == "move":
 
         return ParsedCommand(
 
             action="move",
 
-            camera_id=int(camera_id),
+            camera_id=entities.get(
+                "camera_id"
+            ),
 
-            angle=float(angle),
+            direction=entities.get(
+                "direction"
+            ),
 
-            direction=direction
+            angle=entities.get(
+                "angle",
+                5
+            )
         )
 
-    # -----------------------------
+    # =================================================
     # ZOOM
-    # -----------------------------
+    # =================================================
 
-    zoom_match = re.search(
-        r"zoom (in|out)( (\d+)x)?( continuously)?( camera (\d+))?",
-        command
-    )
-
-    if zoom_match:
-
-        direction = zoom_match.group(1)
-
-        zoom_level = zoom_match.group(3)
-
-        continuous = zoom_match.group(4)
-
-        camera_id = zoom_match.group(6)
+    if intent == "zoom":
 
         return ParsedCommand(
 
             action="zoom",
 
-            camera_id=int(camera_id) if camera_id else None,
+            camera_id=entities.get(
+                "camera_id"
+            ),
 
-            zoom=float(zoom_level) if zoom_level else 1,
+            zoom=entities.get(
+                "zoom",
+                1
+            ),
 
-            zoom_direction=direction,
-
-            continuous=True if continuous else False
+            zoom_direction="in"
         )
 
-    # -----------------------------
+    # =================================================
     # STOP
-    # -----------------------------
+    # =================================================
 
-    stop_match = re.search(
-        r"stop( camera (\d+))?",
-        command
-    )
-
-    if stop_match:
-
-        camera_id = stop_match.group(2)
+    if intent == "stop":
 
         return ParsedCommand(
 
             action="stop",
 
-            camera_id=int(camera_id) if camera_id else None
+            camera_id=entities.get(
+                "camera_id"
+            )
         )
 
-    # -----------------------------
+    # =================================================
     # TRACK
-    # -----------------------------
+    # =================================================
 
-    track_match = re.search(
-        r"(track|follow) (.+?) camera (\d+)",
-        command
-    )
+    if intent == "track":
 
-    if track_match:
+        # -----------------------------
+        # TRACK NEAREST PERSON
+        # -----------------------------
 
-        target = track_match.group(2)
+        if "nearest" in command:
 
-        camera_id = track_match.group(3)
+            return ParsedCommand(
+
+                action="track_nearest_person",
+
+                camera_id=entities.get(
+                    "camera_id"
+                )
+            )
+
+        # -----------------------------
+        # TRACK SUSPICIOUS
+        # -----------------------------
+
+        if "suspicious" in command:
+
+            return ParsedCommand(
+
+                action="track_suspicious",
+
+                camera_id=entities.get(
+                    "camera_id"
+                )
+            )
+
+        # -----------------------------
+        # NORMAL TRACK
+        # -----------------------------
 
         return ParsedCommand(
 
             action="track",
 
-            target=target,
+            target=entities.get(
+                "target"
+            ),
 
-            camera_id=int(camera_id)
+            camera_id=entities.get(
+                "camera_id"
+            )
         )
 
     raise Exception("Invalid command")

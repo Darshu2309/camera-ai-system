@@ -1,7 +1,47 @@
-from services.geo_service import (
-    haversine_distance,
-    calculate_bearing
+from services.geo_service import calculate_bearing
+from services.visibility_engine import (
+    build_visibility_polygon,
+    evaluate_visibility,
+    get_camera_fov,
+    get_camera_range,
+    get_pan_sweep,
 )
+
+
+DEFAULT_VIEW_RANGE_METERS = 150.0
+
+
+def get_camera_label(camera):
+    return camera.get("description") or camera.get("name") or f"Camera {camera.get('id')}"
+
+
+def _get_fov(camera):
+    return get_camera_fov(camera)["horizontal"]
+
+
+def _get_range_meters(camera):
+    return get_camera_range(camera)
+
+
+def get_visible_sector(camera):
+    return get_pan_sweep(camera)
+
+
+def describe_camera_coverage(camera):
+    start, end = get_visible_sector(camera)
+    return {
+        "bearing_start": round(start, 2),
+        "bearing_end": round(end, 2),
+        "range_meters": round(_get_range_meters(camera), 2),
+        "fov_angle": round(_get_fov(camera), 2),
+        "fov": get_camera_fov(camera),
+        "visibility_polygon": build_visibility_polygon(camera),
+    }
+
+
+def target_is_visible(camera, target, target_bearing, distance_meters):
+    visibility = evaluate_visibility(camera, target)
+    return visibility["visible"], visibility["reason"]
 
 
 def select_best_camera(cameras, target):
@@ -42,59 +82,21 @@ def select_best_camera(cameras, target):
                 continue
 
             # =====================================
-            # DISTANCE CALCULATION
-            # =====================================
+            visibility = evaluate_visibility(cam, target)
 
-            distance = haversine_distance(
+            if not visibility["visible"]:
+                print(
+                    "[SKIPPED CAMERA] "
+                    f"{get_camera_label(cam)} "
+                    f"cannot see target: {visibility['reason']}"
+                )
+                continue
 
-                position["latitude"],
-                position["longitude"],
-
-                target["latitude"],
-                target["longitude"]
-            )
-
-            # =====================================
-            # TARGET BEARING
-            # =====================================
-
-            target_bearing = calculate_bearing(
-
-                position["latitude"],
-                position["longitude"],
-
-                target["latitude"],
-                target["longitude"]
-            )
-
-            # =====================================
-            # CURRENT CAMERA ORIENTATION
-            # =====================================
-
-            orientation = cam.get(
-                "orientation",
-                {}
-            )
-
-            cam_pan = orientation.get(
-                "pan",
-                0
-            )
-
-            # =====================================
-            # ANGLE DIFFERENCE
-            # =====================================
-
-            angle_diff = abs(
-                target_bearing - cam_pan
-            )
-
-            # =====================================
             # FINAL SCORE
-            # PURE DISTANCE-BASED
+            # Distance remains important, but only after range/FOV/occlusion checks.
             # =====================================
 
-            score = distance
+            score = visibility["score"]
 
             # =====================================
             # DEBUG LOGGING
@@ -104,7 +106,11 @@ def select_best_camera(cameras, target):
 
 ================================
 
-CAMERA: {cam['id']}
+CAMERA:
+{get_camera_label(cam)}
+
+ID:
+{cam['id']}
 
 TYPE: {cam.get('type', 'fixed')}
 
@@ -115,16 +121,16 @@ LONGITUDE:
 {position['longitude']}
 
 DISTANCE:
-{distance}
+{visibility['distance_meters']} meters
 
 TARGET_BEARING:
-{target_bearing}
+{visibility['target_bearing']}
 
-ANGLE_DIFF:
-{angle_diff}
+VISIBILITY:
+{visibility['reason']}
 
 FINAL_SCORE:
-{score}
+{round(score, 2)}
 
 ================================
 
@@ -162,6 +168,9 @@ CAMERA SELECTED
 ID:
 {best_camera.get('id')}
 
+DESCRIPTION:
+{get_camera_label(best_camera)}
+
 TYPE:
 {best_camera.get('type', 'fixed')}
 
@@ -169,7 +178,7 @@ POSITION:
 {best_camera.get('position')}
 
 BEST SCORE:
-{round(best_score, 4)}
+{round(best_score, 2)}
 
 =============================
 

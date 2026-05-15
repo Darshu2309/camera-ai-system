@@ -1,16 +1,15 @@
 from fastapi import APIRouter
 from fastapi import HTTPException
-import json
 
-with open("cameras.json") as f:
-    cameras = json.load(f)
-    
 from models.point_models import PointRequest
 
 from services.camera_selector import (
+    describe_camera_coverage,
     select_best_camera,
     calculate_ptz
 )
+from services.visibility_engine import evaluate_visibility
+from services.guidance_service import build_operator_guidance
 
 router = APIRouter()
 
@@ -19,6 +18,7 @@ router = APIRouter()
 async def point_api(data: PointRequest):
 
     try:
+        from main import cameras
 
         target = {
 
@@ -81,7 +81,10 @@ Tilt:
             selected_cam["id"],
 
             "camera_name":
-            selected_cam.get("name"),
+            selected_cam.get("description") or selected_cam.get("name"),
+
+            "camera_description":
+            selected_cam.get("description") or selected_cam.get("name"),
 
             "stream_url":
             selected_cam.get(
@@ -90,8 +93,25 @@ Tilt:
 
             "ptz": ptz,
 
+            "coverage":
+            describe_camera_coverage(selected_cam),
+
+            "visibility":
+            evaluate_visibility(selected_cam, target),
+
+            "operator_guidance":
+            build_operator_guidance(
+                event_type="camera_selected",
+                location=f"{target['latitude']:.8f}, {target['longitude']:.8f}",
+                camera=selected_cam.get("description") or selected_cam.get("name"),
+                language="hi",
+            ),
+
             "target": target
         }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
 

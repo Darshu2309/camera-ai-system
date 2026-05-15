@@ -28,6 +28,10 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 
+def haversine_distance_meters(lat1, lon1, lat2, lon2):
+    return haversine_distance(lat1, lon1, lat2, lon2) * 1000
+
+
 def calculate_bearing(lat1, lon1, lat2, lon2):
 
     d_lon = math.radians(lon2 - lon1)
@@ -58,3 +62,23 @@ def calculate_bearing(lat1, lon1, lat2, lon2):
     )
 
     return (bearing + 360) % 360
+
+
+def normalize_angle(angle):
+    return angle % 360
+
+
+def angular_distance(a, b):
+    diff = abs(normalize_angle(a) - normalize_angle(b))
+    return min(diff, 360 - diff)
+
+
+def angle_in_sector(angle, start, end):
+    angle = normalize_angle(angle)
+    start = normalize_angle(start)
+    end = normalize_angle(end)
+
+    if start <= end:
+        return start <= angle <= end
+
+    return angle >= start or angle <= end

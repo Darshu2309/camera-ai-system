@@ -20,7 +20,9 @@ from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from typing import Optional
+
+from pydantic import BaseModel, Field
 
 from ptz_controller import PTZController
 from database import init_db
@@ -29,13 +31,23 @@ from command_controller import parse_command, execute_command
 # from lidar_service import read_lidar
 # from lidar_processing import cluster_lidar
 # from fusion_engine import fuse
-from services.camera_selector import select_best_camera, initialize_camera_orientations
+from services.camera_selector import (
+    describe_camera_coverage,
+    select_best_camera,
+    initialize_camera_orientations,
+)
 from behavior import check_loitering, check_intrusion
 from commands.parser import parse_command
 from commands.validator import validate_command
 from commands.dispatcher import dispatch_command
 from services.tracking_service import tracking_sessions
 from services.geo_service import calculate_bearing
+from services.discovery_service import discover_onvif_cameras, validate_rtsp_url
+from services.guidance_service import build_operator_guidance
+from services.media_event_service import search_events
+from services.visibility_engine import evaluate_visibility
+from routes.command_api import router as command_router
+from routes.point_api import router as point_router
 from camera_health import camera_health, HEALTH_TIMEOUT
 streams = {}
 PTZ_MODE = "simulation"
@@ -54,10 +66,12 @@ CAMERAS_FILE = BASE_DIR / "cameras.json"
 app = FastAPI()
 app.mount(
     "/static",
-    StaticFiles(directory=os.path.join(BASE_DIR, "static")),
+    StaticFiles(directory=BASE_DIR / "static"),
     name="static"
 )
-print("STATIC PATH:", os.path.abspath("static"))
+app.include_router(command_router)
+app.include_router(point_router)
+print("STATIC PATH:", BASE_DIR / "static")
 
 cameras = []
 streams = {}
@@ -70,38 +84,90 @@ def load_camera_store():
     if not CAMERAS_FILE.exists():
         CAMERAS_FILE.write_text("[]")
         return []
-    return json.loads(CAMERAS_FILE.read_text())
+    try:
+        content = CAMERAS_FILE.read_text().strip()
+
+        if not content:
+                return []
+
+        return json.loads(content)
+
+    except Exception as e:
+
+        print("[CAMERA STORE] Failed to load:", e)
+
+        return []
 
 def save_camera_store(data):
     CAMERAS_FILE.write_text(json.dumps(data, indent=4))
 
+
+def public_camera(cam):
+    safe_cam = dict(cam)
+    safe_cam.pop("password", None)
+    safe_cam["description"] = (
+        safe_cam.get("description")
+        or safe_cam.get("name")
+        or f"Camera {safe_cam.get('id')}"
+    )
+    safe_cam["coverage"] = {
+        **safe_cam.get("coverage", {}),
+        **describe_camera_coverage(safe_cam),
+    }
+    return safe_cam
+
 def load_cameras():
+
     global cameras
 
-    cameras = load_camera_store()
+    camera_data = load_camera_store()
 
-    # 🔥 Safety check (VERY IMPORTANT)
-    if not cameras:
-        print("[WARN] No cameras found, initializing empty list")
-        cameras = []
+    normalized = []
 
-    # 🔥 Ensure all cameras have required metadata
-    for cam in cameras:
-        if "position" not in cam:
-            cam["position"] = {"x": 0.0, "y": 0.0, "z": 0.0}
+    for index, cam in enumerate(camera_data, start=1):
 
-        if "orientation" not in cam:
-            cam["orientation"] = {"pan": 0.0, "tilt": 0.0, "zoom": 1.0}
+        # Ensure ID exists
+        if "id" not in cam:
 
-        if "fov" not in cam:
-            cam["fov"] = 90.0
+            cam["id"] = index
 
-        if "status" not in cam:
-            cam["status"] = "active"
+        # Ensure name exists
+        if "name" not in cam:
 
-    print(f"[INFO] Loaded {len(cameras)} cameras with metadata")
+            cam["name"] = f"Camera {cam['id']}"
 
-    # 🔥 CRITICAL FIX → RETURN
+        # Ensure description exists
+        if "description" not in cam:
+
+            cam["description"] = cam["name"]
+
+        # Ensure username exists
+        cam.setdefault("username", "admin")
+
+        # Ensure password exists
+        cam.setdefault("password", "")
+
+        # Ensure rtsp_url exists
+        cam.setdefault("rtsp_url", "")
+
+        # Ensure IP exists
+        cam.setdefault("ip", "0.0.0.0")
+
+        # Ensure status exists
+        cam.setdefault("status", "online")
+
+        # Ensure range exists
+        cam.setdefault("max_range", 150)
+
+        # Ensure FOV exists
+        cam.setdefault("fov_angle", 90)
+
+        normalized.append(cam)
+
+    cameras = normalized
+
+    save_camera_store(cameras)
+
     return cameras
 
 cameras = load_cameras()
@@ -109,6 +175,9 @@ cameras = load_cameras()
 initialize_camera_orientations(cameras)
 # ---------------- RTSP ----------------
 def build_rtsp_url(cam):
+    if cam.get("rtsp_url"):
+        return cam["rtsp_url"]
+
     password = quote(cam.get("password", ""), safe="")
     username = quote(cam.get("username", ""), safe="")
     return f"rtsp://{username}:{password}@{cam['ip']}:554/cam/realmonitor?channel=1&subtype=1"
@@ -182,16 +251,16 @@ class CameraStream:
     # =========================
     def start_new_recording(self):
         try:
-            folder = f"recordings/cam_{self.cam['id']}"
-            os.makedirs(folder, exist_ok=True)
+            folder = BASE_DIR / "recordings" / f"cam_{self.cam['id']}"
+            folder.mkdir(parents=True, exist_ok=True)
 
             filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.avi")
-            path = os.path.join(folder, filename)
+            path = folder / filename
 
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
 
             self.writer = cv2.VideoWriter(
-                path,
+                str(path),
                 fourcc,
                 20.0,
                 (self.width, self.height)
@@ -312,6 +381,9 @@ def init_streams():
 
     # start new
     for cam in cameras:
+        if not cam.get("ip"):
+            continue
+
         if cam["id"] not in streams:
             streams[cam["id"]] = CameraStream(cam)
 
@@ -476,30 +548,35 @@ def classify_camera_health():
 
     for cam in cameras:
         cam_id = cam["id"]
+        stream = streams.get(cam_id)
 
         health = camera_health.get(cam_id)
 
         if not health:
             inactive.append({
                 "camera_id": cam_id,
+                "camera_name": cam.get("description") or cam.get("name"),
                 "status": "inactive",
                 "reason": "No data yet"
             })
             continue
 
         last_seen = health.get("last_seen", 0)
+        has_frame = bool(stream and stream.raw_frame is not None)
 
-        if now - last_seen <= HEALTH_TIMEOUT:
+        if now - last_seen <= HEALTH_TIMEOUT and has_frame:
             active.append({
                 "camera_id": cam_id,
+                "camera_name": cam.get("description") or cam.get("name"),
                 "status": "active",
                 "last_seen_ist": to_ist(last_seen)
             })
         else:
             inactive.append({
                 "camera_id": cam_id,
+                "camera_name": cam.get("description") or cam.get("name"),
                 "status": "inactive",
-                "reason": "Timeout"
+                "reason": "No frame available" if not has_frame else "Timeout"
             })
 
     return active, inactive
@@ -530,19 +607,56 @@ class Position(BaseModel):
 
     longitude: float
 
+    altitude: float = 0.0
+
 class Orientation(BaseModel):
     pan: float
     tilt: float
     zoom: float
 
+
+class Coverage(BaseModel):
+    range_meters: float = 150.0
+    max_range: Optional[float] = None
+    fov_angle: Optional[float] = None
+    vertical_fov: Optional[float] = None
+    bearing_start: Optional[float] = None
+    bearing_end: Optional[float] = None
+    pan_min: Optional[float] = None
+    pan_max: Optional[float] = None
+
+
+class NetworkConfig(BaseModel):
+    mac_address: Optional[str] = None
+    assignment: str = "static"
+    dhcp_reserved: bool = False
+
 class CameraCreate(BaseModel):
-    ip: str
+    ip: str = ""
     username: str
     password: str
-    name: str
+    name: str = ""
+    description: str = ""
+    rtsp_url: str = ""
+    type: str = "fixed"
     position: Position
     orientation: Orientation
     fov: float
+    coverage: Coverage = Field(default_factory=Coverage)
+    network: NetworkConfig = Field(default_factory=NetworkConfig)
+
+
+class DiscoveryRequest(BaseModel):
+    username: str = ""
+    password: str = ""
+    validate_rtsp: bool = False
+
+
+class GuidanceRequest(BaseModel):
+    event_type: str = "suspicious_movement"
+    location: str = "selected location"
+    camera: Optional[str] = None
+    language: str = "hi"
 
 class MoveRequest(BaseModel):
     camera_id: int
@@ -593,7 +707,7 @@ def video(cam_id: int):
 # ---------------- APIs ----------------
 @app.get("/cameras")
 def get_cameras():
-    return cameras
+    return [public_camera(cam) for cam in cameras]
 
 
 @app.get("/status")
@@ -621,8 +735,14 @@ async def add_camera(req: CameraCreate):
     # DUPLICATE CHECK
     # -------------------------------
     for cam in cams:
-        if cam["ip"] == req.ip:
+        if req.ip and cam.get("ip") == req.ip:
             raise HTTPException(status_code=400, detail="Camera already exists")
+
+    if not req.ip and not req.network.mac_address:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide camera IP or MAC address for DHCP reservation workflow",
+        )
 
     # -------------------------------
     # TEMP CAMERA FOR VALIDATION
@@ -632,13 +752,15 @@ async def add_camera(req: CameraCreate):
         "ip": req.ip,
         "username": req.username,
         "password": req.password,
-        "rtsp_url": getattr(req, "rtsp_url", "")
+        "rtsp_url": req.rtsp_url,
     }
 
     # -------------------------------
     # VALIDATE CONNECTION (CRITICAL)
     # -------------------------------
-    is_valid, message = validate_camera_connection(temp_cam)
+    is_valid, message = (True, "DHCP reservation pending")
+    if req.ip:
+        is_valid, message = validate_camera_connection(temp_cam)
 
     if not is_valid:
         raise HTTPException(
@@ -653,13 +775,16 @@ async def add_camera(req: CameraCreate):
 
     cam = {
         "id": new_id,
-        "name": req.name,
+        "name": req.name or req.description or f"Camera {new_id}",
+        "description": req.description or req.name or f"Camera {new_id}",
         "ip": req.ip,
         "username": req.username,
         "password": req.password,
+        "type": req.type,
 
         # 🔥 OPTIONAL RTSP SUPPORT
-        "rtsp_url": getattr(req, "rtsp_url", ""),
+        "rtsp_url": req.rtsp_url,
+        "network": req.network.dict(),
 
         # 🔥 METADATA
         "position": {
@@ -667,14 +792,34 @@ async def add_camera(req: CameraCreate):
             "latitude":
             req.position.latitude,
             "longitude":
-            req.position.longitude
+            req.position.longitude,
+            "altitude":
+            req.position.altitude
         },
         "orientation": {
             "pan": req.orientation.pan,
             "tilt": req.orientation.tilt,
             "zoom": req.orientation.zoom
         },
-        "fov": req.fov
+        "fov": {
+            "horizontal": req.coverage.fov_angle or req.fov,
+            "vertical": req.coverage.vertical_fov or 60.0,
+        },
+        "coverage": {
+            key: value
+            for key, value in req.coverage.dict().items()
+            if value is not None
+        },
+        "status": "pending_network" if not req.ip else "active",
+    }
+
+    cam["coverage"] = {
+        "pan_min": cam["coverage"].get("pan_min"),
+        "pan_max": cam["coverage"].get("pan_max"),
+        "fov_angle": cam["fov"]["horizontal"],
+        "max_range": cam["coverage"].get("max_range") or cam["coverage"].get("range_meters", 150.0),
+        **cam["coverage"],
+        **describe_camera_coverage(cam),
     }
 
     # -------------------------------
@@ -692,7 +837,7 @@ async def add_camera(req: CameraCreate):
 
     return {
         "status": "added",
-        "camera": cam
+        "camera": public_camera(cam)
     }
 
 
@@ -711,20 +856,23 @@ async def delete_camera(req: DeleteRequest):
 
 @app.get("/history/{camera_id}")
 def get_history(camera_id: int):
-    folder = f"recordings/cam_{camera_id}"
+    folder = BASE_DIR / "recordings" / f"cam_{camera_id}"
 
-    if not os.path.exists(folder):
+    if not folder.exists():
         return []
 
-    files = sorted(os.listdir(folder), reverse=True)
+    files = sorted(
+        [file.name for file in folder.iterdir() if file.is_file()],
+        reverse=True,
+    )
 
     return files
 
 @app.get("/history/{camera_id}/{filename}")
 def get_video(camera_id: int, filename: str):
-    path = f"recordings/cam_{camera_id}/{filename}"
+    path = BASE_DIR / "recordings" / f"cam_{camera_id}" / filename
 
-    if not os.path.exists(path):
+    if not path.exists():
         raise HTTPException(404, "File not found")
 
     return FileResponse(path, media_type="video/avi")
@@ -813,7 +961,10 @@ Tilt:
             selected_cam["id"],
 
             "camera_name":
-            selected_cam.get("name"),
+            selected_cam.get("description") or selected_cam.get("name"),
+
+            "camera_description":
+            selected_cam.get("description") or selected_cam.get("name"),
 
             "stream_url":
             selected_cam.get(
@@ -822,8 +973,25 @@ Tilt:
 
             "ptz": ptz,
 
+            "coverage":
+            describe_camera_coverage(selected_cam),
+
+            "visibility":
+            evaluate_visibility(selected_cam, target),
+
+            "operator_guidance":
+            build_operator_guidance(
+                event_type="camera_selected",
+                location=f"{target['latitude']:.8f}, {target['longitude']:.8f}",
+                camera=selected_cam.get("description") or selected_cam.get("name"),
+                language="hi",
+            ),
+
             "target": target
         }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
 
@@ -928,11 +1096,54 @@ async def command_api(req: CommandRequest):
             "message": str(e)
         }
     
-@app.post("/discover-cameras")
-def discover():
-    from camera_discovery import auto_discover_and_register
-    auto_discover_and_register()
-    return {"status": "discovery completed"}
+@app.post("/discover_cameras")
+async def discover_cameras():
+
+    try:
+
+        discovered = discover_onvif_cameras()
+
+        save_camera_store(discovered)
+
+        return {
+            "status": "success",
+            "count": len(discovered),
+            "cameras": discovered
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+
+@app.get("/events")
+def events(
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    camera_id: Optional[int] = None,
+    event_type: Optional[str] = None,
+    limit: int = 100,
+):
+    return search_events(
+        start_time=start_time,
+        end_time=end_time,
+        camera_id=camera_id,
+        event_type=event_type,
+        limit=limit,
+    )
+
+
+@app.post("/operator-guidance")
+def operator_guidance(req: GuidanceRequest):
+    return build_operator_guidance(
+        event_type=req.event_type,
+        location=req.location,
+        camera=req.camera,
+        language=req.language,
+    )
 
 @app.post("/athena/ptztest")
 async def ptz_test(data: dict):

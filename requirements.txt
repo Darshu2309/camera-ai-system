@@ -7,3 +7,12 @@ torchvision
 transformers
 pillow
 numpy
+sqlalchemy
+psycopg2-binary
+python-dotenv
+pydantic
+geoalchemy2
+shapely
+geopandas
+onvif-zeep
+wsdiscovery

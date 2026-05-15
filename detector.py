@@ -1,5 +1,6 @@
 from ultralytics import YOLO
 import cv2
+import os
 import requests
 import time
 import supervision as sv
@@ -13,9 +14,12 @@ last_positions = {}
 last_alert_time = {}
 last_detections_cache = {}
 
-ALERT_API = "http://127.0.0.1:9001/alert"
+ALERT_API = os.getenv("ALERT_API", "http://127.0.0.1:9001/alert")
 ALERT_COOLDOWN = 2
+ALERT_REQUEST_TIMEOUT = 0.75
+ALERT_RETRY_PAUSE = 15
 MOVE_THRESHOLD = 2
+alert_disabled_until = 0
 
 
 # ---------------- TRACKER ----------------
@@ -27,16 +31,23 @@ def get_tracker(camera_id):
 
 # ---------------- ALERT ----------------
 def send_alert(camera_id, frame):
+    global alert_disabled_until
+
+    if time.time() < alert_disabled_until:
+        return
+
     _, img = cv2.imencode(".jpg", frame)
 
     try:
-        requests.post(
+        response = requests.post(
             ALERT_API,
             files={"file": ("alert.jpg", img.tobytes(), "image/jpeg")},
             data={"camera_id": camera_id},
-            timeout=2
+            timeout=ALERT_REQUEST_TIMEOUT
         )
+        response.raise_for_status()
     except Exception as e:
+        alert_disabled_until = time.time() + ALERT_RETRY_PAUSE
         print("ALERT ERROR:", e)
 
 

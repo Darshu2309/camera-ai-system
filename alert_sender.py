@@ -1,7 +1,10 @@
+import os
 import smtplib
 from email.message import EmailMessage
-import os
+from pathlib import Path
+
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
@@ -11,20 +14,26 @@ EMAIL_RECEIVER = EMAIL_SENDER
 
 
 def send_email_alert(image_path, camera_id):
-    msg = EmailMessage()
-    msg['Subject'] = f"🚨 Alert - Camera {camera_id}"
-    msg['From'] = EMAIL_SENDER
-    msg['To'] = EMAIL_RECEIVER
+    image_path = Path(image_path)
 
+    msg = EmailMessage()
+    msg["Subject"] = f"Alert - Camera {camera_id}"
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = EMAIL_RECEIVER
     msg.set_content(f"Motion detected on Camera {camera_id}")
 
-    with open(image_path, 'rb') as f:
-        msg.add_attachment(f.read(), maintype='image', subtype='jpeg', filename=os.path.basename(image_path))
+    with image_path.open("rb") as f:
+        msg.add_attachment(
+            f.read(),
+            maintype="image",
+            subtype="jpeg",
+            filename=image_path.name,
+        )
 
     try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
             smtp.send_message(msg)
-        print("📧 Email sent")
+        print("Email sent")
     except Exception as e:
         print("EMAIL ERROR:", e)
